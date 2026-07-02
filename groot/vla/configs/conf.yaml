@@ -1,7 +1,7 @@
 defaults:
   - _self_  # all below configs will override this conf.yaml
   - model: dreamzero/vla
-  - data: dreamzero/droid_horizon_relative
+  - data: dreamzero/droid_relative
   - override hydra/hydra_logging: disabled  # disable hydra logging
   - override hydra/job_logging: disabled  # disable hydra job logging
 
@@ -124,6 +124,9 @@ training_args:
   ddp_find_unused_parameters: ${ddp_find_unused_parameters}
   ddp_bucket_cap_mb: ${ddp_bucket_cap_mb}
   torch_compile_mode: ${torch_compile_mode}
+  fsdp: null
+  fsdp_config: null
+  fsdp_transformer_layer_cls_to_wrap: null
 
 # === Profiling Arguments ===
 profile_dir: null

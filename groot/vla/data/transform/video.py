@@ -9,6 +9,8 @@ from pydantic import Field, PrivateAttr, field_validator
 import torch
 import torchvision.transforms.v2 as T
 
+from groot.vla.common.utils.device import DEVICE
+
 from groot.vla.data.schema import DatasetMetadata
 from groot.vla.data.transform.base import ModalityTransform
 
@@ -533,9 +535,9 @@ class VideoRandomPosterize(VideoTransform):
 
 class VideoToTensor(VideoTransform):
 
-    output_on_cuda: bool = Field(
+    output_on_accelerator: bool = Field(
         default=False,
-        description="Output the tensor on CUDA if True.",
+        description="Output the tensor on the accelerator device (NPU/CUDA) if True.",
     )
 
     def get_transform(self, mode: Literal["train", "eval"] = "train") -> Callable:
@@ -550,7 +552,7 @@ class VideoToTensor(VideoTransform):
         if self.backend == "torchvision":
             return functools.partial(
                 self.__class__.to_tensor,
-                output_on_cuda=self.output_on_cuda,
+                output_on_accelerator=self.output_on_accelerator,
             )
         else:
             raise ValueError(f"Backend {self.backend} not supported")
@@ -578,18 +580,18 @@ class VideoToTensor(VideoTransform):
             ), f"Video {key} has invalid resolution {input_resolution}, expected {expected_resolution}. Full shape: {data[key].shape}"
 
     @staticmethod
-    def to_tensor(frames: np.ndarray, output_on_cuda: bool) -> torch.Tensor:
+    def to_tensor(frames: np.ndarray, output_on_accelerator: bool) -> torch.Tensor:
         """Convert numpy array to tensor efficiently.
 
         Args:
             frames: numpy array of shape [T, H, W, C] in uint8 format
-            output_on_cuda: whether to output the tensor on CUDA if True.
+            output_on_accelerator: whether to output the tensor on NPU/CUDA if True.
         Returns:
             tensor of shape [T, C, H, W] in range [0, 1]
         """
         frames = torch.from_numpy(frames)
-        if output_on_cuda:
-            frames = frames.cuda()
+        if output_on_accelerator:
+            frames = frames.to(DEVICE)
         frames = frames.to(torch.float32) / 255.0
         return frames.permute(0, 3, 1, 2)  # [T, C, H, W]
 

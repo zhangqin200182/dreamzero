@@ -1,5 +1,6 @@
 import torch, copy
 from groot.vla.model.dreamzero.modules.utils import init_weights_on_device
+from groot.vla.common.utils.device import mem_get_info
 
 
 def cast_to(weight, dtype, device):
@@ -11,9 +12,9 @@ def cast_to(weight, dtype, device):
 class AutoTorchModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        
+
     def check_free_vram(self):
-        gpu_mem_state = torch.cuda.mem_get_info(self.computation_device)
+        gpu_mem_state = mem_get_info(self.computation_device)
         used_memory = (gpu_mem_state[1] - gpu_mem_state[0]) / (1024 ** 3)
         return used_memory < self.vram_limit
 

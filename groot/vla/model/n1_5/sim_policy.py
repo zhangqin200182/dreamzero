@@ -13,6 +13,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 import tree
+
+from groot.vla.common.utils.device import empty_cache
 import time
 
 from groot.vla.data.schema import DatasetMetadata, EmbodimentTag
@@ -60,7 +62,7 @@ class ModelManager:
         if policy.eval_bf16:
             policy.trained_model = policy.trained_model.to(dtype=torch.bfloat16)
             
-        torch.cuda.empty_cache()  # Clear cache after loading
+        empty_cache()  # Clear cache after loading
     
     def activate_model(self, name: str):
         """Activate a model - for VLM this is a no-op, for action_head this manages components."""
@@ -101,7 +103,7 @@ class ModelManager:
         if policy.eval_bf16:
             policy.trained_model = policy.trained_model.to(dtype=torch.bfloat16)
             
-        torch.cuda.empty_cache()  # Clear cache after loading
+        empty_cache()  # Clear cache after loading
         
     def offload_action_head_components(self):
         """Offload action head components to CPU."""
@@ -125,7 +127,7 @@ class ModelManager:
             else:
                 policy.trained_model.to(device='cpu')
                 
-        torch.cuda.empty_cache()  # Clear cache after offloading
+        empty_cache()  # Clear cache after offloading
         self.active_components = None
 
     def load_model(self, name: str):
@@ -348,7 +350,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         except Exception as e:
             print("Skipping parallelization")
 
-        torch.cuda.empty_cache()
+        empty_cache()
 
         self.trained_model = model
 
@@ -487,7 +489,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
                 self.trained_model.action_head.disable_vram_management()
         
         self.trained_model.to(device='cpu')
-        torch.cuda.empty_cache()
+        empty_cache()
         print(f"Model offloaded to CPU")
 
     def load_to_gpu(self):
@@ -504,7 +506,7 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         if self.eval_bf16:
             self.trained_model = self.trained_model.to(dtype=torch.bfloat16)
             
-        torch.cuda.empty_cache()
+        empty_cache()
 
     def ensure_model_on_gpu(self):
         """Ensure the model is loaded on GPU before inference."""

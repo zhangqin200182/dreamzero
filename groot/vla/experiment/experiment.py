@@ -10,6 +10,7 @@ import torch
 
 from groot.vla.experiment.base import BaseExperiment, BaseTrainer
 from groot.vla.utils.action_args_override_utils import apply_action_overrides
+from groot.vla.common.utils.device import AUTOCAST_DEVICE, Event, synchronize
 
 logger = logging.getLogger(__name__)
 
@@ -71,25 +72,25 @@ class VLATrainerInferenceBenchmark(VLATrainer):
 
         model.eval()
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=AUTOCAST_DEVICE, dtype=torch.bfloat16):
             with torch.inference_mode():
                 for i in range(warmup_steps):
                     action = model.module.get_action(inputs)
                     action.keys()
 
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        torch.cuda.synchronize()
+        start_event = Event(enable_timing=True)
+        end_event = Event(enable_timing=True)
+        synchronize()
         start_event.record()
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.autocast(device_type=AUTOCAST_DEVICE, dtype=torch.bfloat16):
             with torch.inference_mode():
                 for i in range(measure_steps):
                     action = model.module.get_action(inputs)
                     action.keys()
 
         end_event.record()
-        torch.cuda.synchronize()
+        synchronize()
         elapsed_time = start_event.elapsed_time(end_event)
 
         time_per_step = elapsed_time / measure_steps

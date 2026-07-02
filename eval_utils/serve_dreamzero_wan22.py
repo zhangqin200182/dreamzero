@@ -1,14 +1,7 @@
 """
 Serve the DreamZero 5B implementation (Wan2.2-TI2V-5B) over the websocket policy server.
 
-This is the 5B model: Wan2.2 diffusion backbone, 48-channel VAE38, frame_seqlen=50 (160×320
-latent 10×20). Inference is causal with KV caching: first request in a session uses 1 frame
-and warms the cache; subsequent requests use FRAMES_PER_CHUNK=4 frames and append to the cache.
-On session_id change (or explicit reset), buffers and action_head.current_start_frame are cleared.
-
-The checkpoint at model_path should be DreamZero with Wan22 5B (model/dreamzero/action_head=
-wan_flow_matching_action_tf_wan22, data droid_relative_wan22 → 160×320). GrootSimPolicy loads
-that checkpoint and runs inference; it is the correct policy class for DreamZero.
+Same as above. Uses device abstraction layer for NPU/CUDA flexibility.
 
 Usage (single GPU):
 
@@ -38,6 +31,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 import tyro
+
+from groot.vla.common.utils.device import (
+    get_dist_backend, get_device_mesh_name, set_device, DEVICE_STR,
+)
 
 # Avoid FailOnRecompileLimitHit when serving: the flow scheduler's torch.compile'd
 # multistep_uni_p_bh_update recompiles under varying shapes/inputs (e.g. batch size,
@@ -112,8 +109,8 @@ def _maybe_init_distributed():
         return
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "29500")
-    dist.init_process_group(backend="nccl", rank=0, world_size=1)
-    torch.cuda.set_device(0)
+    dist.init_process_group(backend=get_dist_backend(), rank=0, world_size=1)
+    set_device(0)
 
 
 # Modality key mappings: client observation keys -> model input keys per embodiment.
@@ -342,7 +339,7 @@ def main(
     logging.basicConfig(level=logging.INFO, force=True)
 
     _maybe_init_distributed()
-    device_mesh = init_device_mesh("cuda", mesh_shape=(1,), mesh_dim_names=("ip",))
+    device_mesh = init_device_mesh(get_device_mesh_name(), mesh_shape=(1,), mesh_dim_names=("ip",))
 
     logger.info("Loading DreamZero Wan22 policy from %s (embodiment=%s)", model_path, embodiment_tag)
     checkpoint_name = os.path.basename(model_path.rstrip("/"))
@@ -351,7 +348,7 @@ def main(
         embodiment_tag=EmbodimentTag(embodiment_tag),
         model_path=model_path,
         tokenizer_path_override=tokenizer_path,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device=DEVICE_STR,
         device_mesh=device_mesh,
     )
     if image_height is not None and image_width is not None:

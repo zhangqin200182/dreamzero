@@ -81,12 +81,16 @@ def set_deterministic(flag: bool = True):
     if not flag:
         return
 
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    os.environ["HOROVOD_FUSION_THRESHOLD"] = "0"
-    import torch.backends.cudnn as cudnn
+    # CUDA-specific settings (skipped on NPU/CPU)
+    try:
+        import torch.backends.cudnn as cudnn
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        os.environ["HOROVOD_FUSION_THRESHOLD"] = "0"
+        cudnn.deterministic = True
+        cudnn.benchmark = False
+    except ImportError:
+        pass
 
-    cudnn.deterministic = True
-    cudnn.benchmark = False
     if hasattr(torch, "use_deterministic_algorithms"):
         # only available in PyTorch >= 1.9
         torch.use_deterministic_algorithms(True)
@@ -122,8 +126,9 @@ def set_seed_everywhere(
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    from groot.vla.common.utils.device import manual_seed_all, is_accelerator_available
+    if is_accelerator_available():
+        manual_seed_all(seed)
     if set_tensorflow:
         try:
             import tensorflow as tf

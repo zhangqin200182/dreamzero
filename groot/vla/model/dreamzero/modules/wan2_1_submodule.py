@@ -13,6 +13,15 @@ __all__ = ['WanModel']
 
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
 
+def _npu_available():
+    try:
+        import torch_npu
+        return torch.npu.is_available()
+    except ImportError:
+        return False
+
+USE_REAL_ROPE = ENABLE_TENSORRT or _npu_available()
+
 def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
     # preprocess
     assert dim % 2 == 0
@@ -27,7 +36,7 @@ def sinusoidal_embedding_1d(dim: int, position: torch.Tensor) -> torch.Tensor:
 
 
 def rope_params(max_seq_len, dim, theta=10000):
-    if ENABLE_TENSORRT:
+    if USE_REAL_ROPE:
         return rope_params_no_polar(max_seq_len, dim, theta)
     else:
         return rope_params_polar(max_seq_len, dim, theta)
@@ -55,7 +64,7 @@ def rope_params_no_polar(max_seq_len: int, dim: int, theta: float = 10000) -> to
     return emb
 
 def rope_apply(x, grid_sizes, freqs):
-    if ENABLE_TENSORRT:
+    if USE_REAL_ROPE:
         return rope_apply_no_polar(x, freqs)
     else:
         return rope_apply_polar(x, freqs)
@@ -77,20 +86,22 @@ def rope_apply_polar(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
 def rope_apply_no_polar(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
     B, seq_len, n, D = x.shape
 
-    # Reshape freqs to be broadcastable: (1, seq_len, 1, D)
-    freqs = freqs.unsqueeze(0).unsqueeze(2)
+    freqs = freqs.unsqueeze(0)
 
-    x0, x1 = x.chunk(2, dim=-1)
-    freqs_cos, freqs_sin = freqs.chunk(2, dim=-1)
+    x = x.reshape(B, seq_len, n, -1, 2)
+    x_real, x_imag = x[..., 0], x[..., 1]
 
-    rotated_x0 = x0 * freqs_cos - x1 * freqs_sin
-    rotated_x1 = x1 * freqs_cos + x0 * freqs_sin
-    x_rotated = torch.cat((rotated_x0, rotated_x1), dim=-1)
-    return x_rotated
+    freqs = freqs.view(1, freqs.shape[1], 1, -1, 2)
+    freqs_cos, freqs_sin = freqs[..., 0], freqs[..., 1]
+
+    x_real_rot = x_real * freqs_cos - x_imag * freqs_sin
+    x_imag_rot = x_real * freqs_sin + x_imag * freqs_cos
+
+    return torch.stack((x_real_rot, x_imag_rot), dim=-1).flatten(3)
 
 
 def rope_action_apply(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block=32, num_state_per_block=1):
-    if ENABLE_TENSORRT:
+    if USE_REAL_ROPE:
         return rope_action_apply_no_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block)
     else:
         return rope_action_apply_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block)
@@ -109,21 +120,22 @@ def rope_action_apply_no_polar(
 
     if action_register_length is not None:
         chunk_size = action_register_length // (num_action_per_block + num_state_per_block)
-        freqs_1d_action = freqs_action[:chunk_size * num_action_per_block]
-        freqs_1d_state = freqs_state[:chunk_size * num_state_per_block]
+        freqs_1d_action = freqs_action[:chunk_size * num_action_per_block].view(chunk_size * num_action_per_block, 1, -1)
+        freqs_1d_state = freqs_state[:chunk_size * num_state_per_block].view(chunk_size * num_state_per_block, 1, -1)
         freqs = torch.cat([freqs, freqs_1d_action, freqs_1d_state], dim=0)
 
-    # Reshape freqs to be broadcastable: (1, seq_len, 1, D)
-    freqs = freqs.unsqueeze(0).unsqueeze(2)
+    freqs = freqs.unsqueeze(0)
 
-    x0, x1 = x.chunk(2, dim=-1)
-    freqs_cos, freqs_sin = freqs.chunk(2, dim=-1)
+    x = x.reshape(B, seq_len, n, -1, 2)
+    x_real, x_imag = x[..., 0], x[..., 1]
 
-    rotated_x0 = x0 * freqs_cos - x1 * freqs_sin
-    rotated_x1 = x1 * freqs_cos + x0 * freqs_sin
-    x_rotated = torch.cat((rotated_x0, rotated_x1), dim=-1)
+    freqs = freqs.view(1, freqs.shape[1], 1, -1, 2)
+    freqs_cos, freqs_sin = freqs[..., 0], freqs[..., 1]
 
-    return x_rotated
+    x_real_rot = x_real * freqs_cos - x_imag * freqs_sin
+    x_imag_rot = x_real * freqs_sin + x_imag * freqs_cos
+
+    return torch.stack((x_real_rot, x_imag_rot), dim=-1).flatten(3)
 
 
 # @amp.autocast(enabled=False)

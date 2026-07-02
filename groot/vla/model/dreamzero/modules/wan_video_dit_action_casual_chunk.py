@@ -27,6 +27,15 @@ import os
 
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
 
+def _npu_available():
+    try:
+        import torch_npu
+        return torch.npu.is_available()
+    except ImportError:
+        return False
+
+USE_REAL_ROPE = ENABLE_TENSORRT or _npu_available()
+
 
 class CategorySpecificLinear(nn.Module):
     def __init__(self, num_categories, input_dim, hidden_dim):
@@ -91,7 +100,7 @@ class MultiEmbodimentActionEncoder(nn.Module):
 
 
 def causal_rope_action_apply(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block, action_state_index):
-    if ENABLE_TENSORRT:
+    if USE_REAL_ROPE:
         return causal_rope_action_apply_no_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block, action_state_index)
     else:
         return causal_rope_action_apply_polar(x, freqs, freqs_action, freqs_state, action_register_length, num_action_per_block, num_state_per_block, action_state_index)
@@ -2125,9 +2134,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             is_tf=clean_x is not None,
         )
 
-        def create_custom_forward(module):
-            def custom_forward(*inputs, **kwargs):
-                outputs, updated_kv_cache = module(*inputs, **kwargs)
+        def create_custom_forward(module, **fwd_kwargs):
+            def custom_forward(x):
+                outputs, updated_kv_cache = module(x, **fwd_kwargs)
                 assert updated_kv_cache is None
                 return outputs
             return custom_forward
@@ -2135,12 +2144,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         for block in self.blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, **kwargs,
-                    use_reentrant=False,
+                    create_custom_forward(block, **kwargs),
+                    x,
+                    use_reentrant=True,
                 )
             else:
-                x = block(x, **kwargs)
+                x, _kv_cache = block(x, **kwargs)
 
         if clean_x is not None:
             x = x[:, clean_x.shape[1]:]

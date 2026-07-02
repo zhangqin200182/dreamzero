@@ -25,6 +25,8 @@ from tianshou.data import Batch
 import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
+from groot.vla.common.utils.device import get_dist_backend, get_device_mesh_name, set_device
+
 # Use roboarena policy server interface
 from eval_utils.policy_server import WebsocketPolicyServer as RoboarenaServer
 from eval_utils.policy_server import PolicyServerConfig
@@ -713,16 +715,17 @@ class WebsocketPolicyServer:
 
 def init_mesh() -> DeviceMesh:
     # env vars set by torchrun
-    dist.init_process_group("nccl")
+    backend = get_dist_backend()
+    dist.init_process_group(backend)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     print(f"Rank {rank}/{world_size} (PID: {os.getpid()}) setting device to {rank}")
 
-    torch.cuda.set_device(rank)
-    device = torch.device(f"cuda:{rank}")
+    set_device(rank)
+    device = torch.device(f"{get_device_mesh_name()}:{rank}")
 
     mesh = init_device_mesh(
-        device_type="cuda",
+        device_type=get_device_mesh_name(),
         mesh_shape=(world_size, ),
         mesh_dim_names=("ip", ),
     )

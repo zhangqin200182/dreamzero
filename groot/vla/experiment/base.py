@@ -32,6 +32,15 @@ import numpy as np
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
 from torch.profiler import ProfilerActivity, profile
+
+from groot.vla.common.utils.device import (
+    synchronize,
+    memory_allocated,
+    record_memory_history,
+    dump_memory_snapshot,
+    get_profiler_activities,
+    is_accelerator_available,
+)
 from torch.utils.data import DataLoader, Dataset, Sampler
 import transformers
 from transformers import TrainerCallback, set_seed
@@ -226,10 +235,7 @@ class ProfCallback(transformers.TrainerCallback):
                 f"Starting profiler at global step {state.global_step} (session step {self.session_step})"
             )
             self.prof = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
+                activities=get_profiler_activities(),
                 schedule=torch.profiler.schedule(
                     skip_first=0,
                     wait=0,
@@ -268,9 +274,9 @@ class ProfCallback(transformers.TrainerCallback):
             del self.prof
             self.prof = None
 
-            # Force CUDA synchronization to ensure profiler cleanup completes
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            # Force accelerator synchronization to ensure profiler cleanup completes
+            if is_accelerator_available():
+                synchronize()
 
             self.profiling_complete = True
             logging.info(
@@ -359,12 +365,17 @@ class BaseTrainer(transformers.Trainer):
             self.torch_profile_dir.mkdir(exist_ok=True, parents=True)
 
             # Start recording the memory history.
-            torch.cuda.memory._record_memory_history(max_entries=100000)
+            record_memory_history(max_entries=100000)
 
         super().__init__(**kwargs)
 
         self.loss_queues = {}
         self.loss_queue_size = 10
+
+    def _move_model_to_device(self, model, device):
+        if self.args.fsdp:
+            return
+        super()._move_model_to_device(model, device)
 
     def _get_train_sampler(self):
         return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
@@ -373,10 +384,54 @@ class BaseTrainer(transformers.Trainer):
         return BaseSampler(eval_dataset, shuffle=False)
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        import gc
+        from groot.vla.common.utils.device import empty_cache, synchronize
+
+        synchronize()
+        model.zero_grad(set_to_none=True)
+
+        # NPU fix: _post_backward_final_callback does not execute on NPU
+        # (Variable._execution_engine.queue_callback fails). This leaves stale
+        # _post_backward_hook_state on flat_params, preventing hook re-registration
+        # on subsequent steps. Without new hooks, params are never resharded → OOM.
+
+        # Reset FSDP execution order tracking
+        try:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            for fsdp_module in FSDP.fsdp_modules(model):
+                if hasattr(fsdp_module, '_exec_order_data'):
+                    fsdp_module._exec_order_data._iter = 0
+                    fsdp_module._exec_order_data.handles_post_forward_order.clear()
+                if hasattr(fsdp_module, '_pre_backward_hook_full_params_prefetched'):
+                    fsdp_module._pre_backward_hook_full_params_prefetched = False
+                if hasattr(fsdp_module, '_handle') and fsdp_module._handle is not None:
+                    h = fsdp_module._handle
+                    if hasattr(h, '_needs_pre_backward_unshard'):
+                        h._needs_pre_backward_unshard = False
+                    if hasattr(h, '_prefetched'):
+                        h._prefetched = False
+        except Exception:
+            pass
+
+        # Force re-registration of post-backward hooks
+        try:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            for fsdp_module in FSDP.fsdp_modules(model):
+                if hasattr(fsdp_module, '_handle') and fsdp_module._handle is not None:
+                    fp = fsdp_module._handle.flat_param
+                    if hasattr(fp, '_post_backward_hook_state'):
+                        fp._post_backward_hook_state[-1].remove()
+                        del fp._post_backward_hook_state
+        except Exception:
+            pass
+
+        gc.collect()
+        empty_cache()
+
         enable_profile = self.enable_profiling and self.current_step % self.profiling_steps == 0
         if enable_profile:
             profile_context = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                activities=get_profiler_activities(),
                 record_shapes=True,
                 with_stack=True,
             )
@@ -387,6 +442,18 @@ class BaseTrainer(transformers.Trainer):
 
         with self.timer.with_label("training_step"), profile_context as prof:
             output = super().training_step(model, inputs)
+
+        # Reset FSDP training states after backward (NPU: callback doesn't run)
+        try:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            from torch.distributed.fsdp._common_utils import TrainingState, HandleTrainingState
+            for fsdp_state in FSDP.fsdp_modules(model):
+                fsdp_state.training_state = TrainingState.IDLE
+                if hasattr(fsdp_state, "_handle") and fsdp_state._handle is not None:
+                    fsdp_state._handle._training_state = HandleTrainingState.IDLE
+                    fsdp_state._handle._ran_pre_backward_hook = False
+        except Exception:
+            pass
 
         time_taken = time.time() - start_time
         print(
@@ -400,7 +467,7 @@ class BaseTrainer(transformers.Trainer):
 
             snapshot_path = f"{self.memory_profile_dir}/memory_snapshot_rank_{self.global_rank}_step_{self.current_step}.pickle"
             print(f"Rank {self.global_rank} dumping memory snapshot to {snapshot_path}")
-            torch.cuda.memory._dump_snapshot(snapshot_path)
+            dump_memory_snapshot(snapshot_path)
 
         self.current_step += 1
         return output
@@ -658,6 +725,8 @@ class BaseExperiment(ABC):
         if hasattr(model.action_head, "max_steps"):
             model.action_head.max_steps = cfg.max_steps
 
+        self._apply_fsdp_activation_checkpointing(model, training_args)
+
         # Make sure model_dtype and training_args dtype are compatible.
         compute_dtype = dtype_from_string(model.config.model_dtype)
 
@@ -696,6 +765,22 @@ class BaseExperiment(ABC):
         self.resume_from_checkpoint = resume_from_checkpoint
         self.train_dataset = train_dataset
         self.trainer = trainer
+
+    def _apply_fsdp_activation_checkpointing(self, model, training_args):
+        from groot.vla.common.utils.device import DEVICE_TYPE
+        if DEVICE_TYPE != "npu" or not training_args.fsdp:
+            return
+
+        import torch.distributed.fsdp._common_utils as fsdp_common
+        import torch.distributed.fsdp._runtime_utils as fsdp_runtime
+        _orig_assert = fsdp_common._assert_in_training_states
+        def _relaxed_assert(state, training_states):
+            if state.training_state not in training_states:
+                from torch.distributed.fsdp._common_utils import TrainingState
+                state.training_state = TrainingState.FORWARD_BACKWARD
+        fsdp_common._assert_in_training_states = _relaxed_assert
+        fsdp_runtime._assert_in_training_states = _relaxed_assert
+        mprint("Applied FSDP-aware activation checkpointing on NPU (CausalWanAttentionBlock)")
 
     def create_model(self, cfg, training_args):
         model = instantiate(cfg.model)
@@ -860,7 +945,7 @@ class BaseExperiment(ABC):
             f"train dataloader length: {train_dl_len}\n"
             f"eval dataloader length: {eval_dl_len}\n"
             f"train dataset length: {len(trainer.train_dataset)}\n"
-            f"GPU memory before training: {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB",
+            f"Accelerator memory before training: {memory_allocated() / 1024 / 1024 / 1024} GB",
             flush=True,
         )
         return trainer

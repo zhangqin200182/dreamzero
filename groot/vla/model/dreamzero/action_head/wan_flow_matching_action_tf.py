@@ -17,6 +17,9 @@ from safetensors.torch import load_file
 import json
 from huggingface_hub import hf_hub_download
 
+from groot.vla.common.utils.device import (
+    DEVICE, DEVICE_STR, AUTOCAST_DEVICE, Event, synchronize, empty_cache
+)
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +206,7 @@ class WANPolicyHead(ActionHead):
         self.ip_size = 1
         self.ip_group = None
         
-        self._device = "cuda"
+        self._device = DEVICE_STR
         self.dynamic_cache_schedule = os.getenv("DYNAMIC_CACHE_SCHEDULE", "False").lower() == "true"
 
 
@@ -364,6 +367,28 @@ class WANPolicyHead(ActionHead):
         if not self.defer_lora_injection:
             self.print_trainable_params()
 
+        self.to(dtype=torch.bfloat16)
+
+        self._deregister_frozen_encoders()
+
+
+    def _deregister_frozen_encoders(self):
+        """Remove frozen encoders from nn.Module tree so FSDP won't move them.
+
+        They stay on CPU and are lazily moved to device on first forward call.
+        After deregistration, self.text_encoder / self.image_encoder / self.vae
+        still work as plain Python attributes (not tracked by nn.Module).
+        """
+        _te = self.text_encoder
+        _ie = self.image_encoder
+        _va = self.vae
+        del self._modules['text_encoder']
+        del self._modules['image_encoder']
+        del self._modules['vae']
+        object.__setattr__(self, 'text_encoder', _te)
+        object.__setattr__(self, 'image_encoder', _ie)
+        object.__setattr__(self, 'vae', _va)
+
 
     def print_trainable_params(self):
         """Print trainable parameters of the diffusion model."""
@@ -441,7 +466,7 @@ class WANPolicyHead(ActionHead):
                 onload_dtype=dtype,
                 onload_device="cpu",
                 computation_dtype=self.dtype,
-                computation_device='cuda',
+                computation_device=DEVICE_STR,
             ),
         )
 
@@ -479,7 +504,7 @@ class WANPolicyHead(ActionHead):
                     print("togpu")
                     model.to(self._device)
         # fresh the cuda cache
-        torch.cuda.empty_cache()
+        empty_cache()
 
     def _create_kv_caches(
         self,
@@ -539,7 +564,20 @@ class WANPolicyHead(ActionHead):
         image = (image * (2 / 255) - 1).permute(0, 1, 4, 2, 3)
         return image
 
+    def _ensure_text_encoder_on_device(self, ref_tensor):
+        if not getattr(self, '_text_enc_device_ready', False):
+            self.text_encoder.to(device=ref_tensor.device, dtype=torch.bfloat16)
+            self.text_encoder.eval()
+            self._text_enc_device_ready = True
+
+    def _ensure_image_encoder_on_device(self, ref_tensor):
+        if not getattr(self, '_image_enc_device_ready', False):
+            self.image_encoder.to(device=ref_tensor.device, dtype=torch.bfloat16)
+            self.image_encoder.eval()
+            self._image_enc_device_ready = True
+
     def encode_prompt(self, input_ids, attention_mask):
+        self._ensure_text_encoder_on_device(input_ids)
         seq_lens = attention_mask.gt(0).sum(dim=1).long()
         prompt_emb = self.text_encoder(input_ids, attention_mask)
         prompt_emb = prompt_emb.clone().to(dtype=torch.bfloat16)
@@ -548,7 +586,6 @@ class WANPolicyHead(ActionHead):
         return prompt_emb
 
     def _ensure_vae_on_device(self, ref_tensor):
-        """Lazily move the VAE to the correct device/dtype on first use."""
         if not getattr(self, '_vae_device_ready', False):
             self.vae.to(device=ref_tensor.device, dtype=torch.bfloat16)
             self.vae.eval()
@@ -561,6 +598,7 @@ class WANPolicyHead(ActionHead):
         return latents
 
     def encode_image(self, image, num_frames, height, width):
+        self._ensure_image_encoder_on_device(image)
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             batch_size = image.shape[0]
             clip_context = self.image_encoder.encode_image(image)
@@ -584,10 +622,11 @@ class WANPolicyHead(ActionHead):
         return {}
 
     def add_lora_to_model(self, model, lora_rank=4, lora_alpha=4, lora_target_modules="q,k,v,o,ffn.0,ffn.2", init_lora_weights="kaiming") -> nn.Module:
-        # Add LoRA to UNet
         self.lora_alpha = lora_alpha
         if init_lora_weights == "kaiming":
             init_lora_weights = True
+
+        model.to(dtype=torch.bfloat16)
 
         lora_config = LoraConfig(
             r=lora_rank,
@@ -596,8 +635,6 @@ class WANPolicyHead(ActionHead):
             target_modules=lora_target_modules.split(","),
         )
         model = get_peft_model(model, lora_config)
-        for param in model.parameters():
-            param.data = param.to(torch.float32)
         return model
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
@@ -974,16 +1011,16 @@ class WANPolicyHead(ActionHead):
         start_time = time.perf_counter()
 
         # Tracking time taken on GPU for various operations.
-        start_text_encoder_event = torch.cuda.Event(enable_timing=True)
-        end_text_encoder_event = torch.cuda.Event(enable_timing=True)
-        start_image_encoder_event = torch.cuda.Event(enable_timing=True)
-        end_image_encoder_event = torch.cuda.Event(enable_timing=True)
-        start_vae_event = torch.cuda.Event(enable_timing=True)
-        end_vae_event = torch.cuda.Event(enable_timing=True)
-        start_kv_event = torch.cuda.Event(enable_timing=True)
-        end_kv_event = torch.cuda.Event(enable_timing=True)
-        start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)]
-        end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in range(self.num_inference_steps)]
+        start_text_encoder_event = Event(enable_timing=True)
+        end_text_encoder_event = Event(enable_timing=True)
+        start_image_encoder_event = Event(enable_timing=True)
+        end_image_encoder_event = Event(enable_timing=True)
+        start_vae_event = Event(enable_timing=True)
+        end_vae_event = Event(enable_timing=True)
+        start_kv_event = Event(enable_timing=True)
+        end_kv_event = Event(enable_timing=True)
+        start_diffusion_events = [Event(enable_timing=True) for _ in range(self.num_inference_steps)]
+        end_diffusion_events = [Event(enable_timing=True) for _ in range(self.num_inference_steps)]
 
         self.set_frozen_modules_to_eval_mode()
         data = action_input 
@@ -1101,8 +1138,8 @@ class WANPolicyHead(ActionHead):
 
         end_vae_event.record()
 
-        noise_obs = self.generate_noise((image.shape[0], image.shape[1], self.num_frame_per_block, image.shape[3], image.shape[4]), seed=self.seed, device='cuda', dtype=torch.bfloat16)
-        noise_action = self.generate_noise((image.shape[0], self.action_horizon, self.model.action_dim), seed=self.seed, device='cuda', dtype=torch.bfloat16)
+        noise_obs = self.generate_noise((image.shape[0], image.shape[1], self.num_frame_per_block, image.shape[3], image.shape[4]), seed=self.seed, device=DEVICE, dtype=torch.bfloat16)
+        noise_action = self.generate_noise((image.shape[0], self.action_horizon, self.model.action_dim), seed=self.seed, device=DEVICE, dtype=torch.bfloat16)
         batch_size, num_channels, num_frames, height, width = noise_obs.shape
         ######### Generate video #########
         # DiT patch_embedding uses stride (1,2,2), so tokens per frame = (H//2)*(W//2)
@@ -1221,8 +1258,8 @@ class WANPolicyHead(ActionHead):
             if self.ip_rank == 0:
                 print(f"Decoupled inference: video sigmas {sigma_max:.3f} -> {sample_scheduler.sigmas[-1].item():.3f}")
 
-        start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
-        end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
+        start_diffusion_events = [Event(enable_timing=True) for _ in sample_scheduler.timesteps]
+        end_diffusion_events = [Event(enable_timing=True) for _ in sample_scheduler.timesteps]
         prev_predictions = [] 
         self.skip_countdown = 0
         dit_compute_steps = 0
@@ -1312,9 +1349,9 @@ class WANPolicyHead(ActionHead):
             output = torch.cat([image, output], dim=1)
         self.current_start_frame += self.num_frame_per_block
 
-        # Do torch.cuda.synchronize() to ensure all operations are completed before timing.
+        # Synchronize to ensure all operations are completed before timing.
         # This isn't expected to affect inference performance since it's at the end of an inference step.
-        torch.cuda.synchronize()
+        synchronize()
 
         total_time = time.perf_counter() - start_time
         text_encoder_time = start_text_encoder_event.elapsed_time(end_text_encoder_event) / 1000

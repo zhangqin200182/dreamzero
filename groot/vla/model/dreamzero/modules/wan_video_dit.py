@@ -7,6 +7,7 @@ from typing import Tuple, Optional
 from einops import rearrange
 from groot.vla.model.dreamzero.modules.utils import hash_state_dict_keys
 from groot.vla.model.dreamzero.modules.wan_video_camera_controller import SimpleAdapter
+from groot.vla.common.utils.device import gpu_supports_flash_attention, DEVICE
 try:
     import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
@@ -26,23 +27,20 @@ except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
 
 
-def _gpu_supports_flash_attention():
-    """FlashAttention requires Ampere (compute capability 8.0) or newer."""
-    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
-        return False
-    try:
-        if not torch.cuda.is_available():
-            return False
-        cap = torch.cuda.get_device_capability()
-        return cap[0] >= 8
-    except Exception:
-        return False
-
-
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
     
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
+
+def _npu_available():
+    try:
+        import torch_npu
+        return torch.npu.is_available()
+    except ImportError:
+        return False
+
+USE_REAL_ROPE = ENABLE_TENSORRT or _npu_available()
+
 if ENABLE_TENSORRT:
     # disable torch compile and transformer engine and flash attention for onnx/tensorrt export
     FLASH_ATTN_COMPATIBILITY_MODE = True
@@ -52,7 +50,7 @@ else:
     FLASH_ATTN_COMPATIBILITY_MODE = False
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
     # Use PyTorch SDPA on pre-Ampere GPUs or when compatibility_mode (FlashAttention requires Ampere or newer)
-    if compatibility_mode or not _gpu_supports_flash_attention():
+    if compatibility_mode or not gpu_supports_flash_attention():
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
@@ -149,14 +147,14 @@ def _RMSNorm(normalized_shape, eps):
 
 
 def RotaryPositionEmbedding(num_heads, head_dim):
-    if ENABLE_TENSORRT:
+    if USE_REAL_ROPE:
         return RotaryPositionEmbeddingNoPolarOp(num_heads, head_dim)
     else:
         return RotaryPositionEmbeddingWithPolarOp(num_heads, head_dim)
 
 
 def rope_apply(x, freqs, num_heads):
-    if ENABLE_TENSORRT:
+    if USE_REAL_ROPE:
         return rope_apply_no_polar_op(x, freqs, num_heads)
     else:
         return rope_apply_polar_op(x, freqs, num_heads)
@@ -208,7 +206,7 @@ class RotaryPositionEmbeddingNoPolarOp(nn.Module):
 
     def post_initialize(self):
         self.freqs = {
-            key: (value[0].to("cuda"), value[1].to("cuda")) for key, value in self.freqs.items()
+            key: (value[0].to(DEVICE), value[1].to(DEVICE)) for key, value in self.freqs.items()
         }
 
 
@@ -246,7 +244,7 @@ class RotaryPositionEmbeddingWithPolarOp(nn.Module):
         return freqs
 
     def post_initialize(self):
-        self.freqs = {key: value.to(device="cuda") for key, value in self.freqs.items()}
+        self.freqs = {key: value.to(device=DEVICE) for key, value in self.freqs.items()}
 
 
 class AttentionModule(nn.Module):
@@ -511,9 +509,9 @@ class WanModel(ModelMixin, ConfigMixin):
         # print("x and context shape", x.shape, context.shape, f,h,w)
         
         freqs = self.rope(f=f, h=h, w=w, a=x.shape[1])
-        def create_custom_forward(module):
-            def custom_forward(*inputs):
-                return module(*inputs)
+        def create_custom_forward(module, context, t_mod, freqs):
+            def custom_forward(x):
+                return module(x, context, t_mod, freqs)
             return custom_forward
 
         for block in self.blocks:
@@ -521,15 +519,15 @@ class WanModel(ModelMixin, ConfigMixin):
                 if self.use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():
                         x = torch.utils.checkpoint.checkpoint(
-                            create_custom_forward(block),
-                            x, context, t_mod, freqs,
-                            use_reentrant=False,
+                            create_custom_forward(block, context, t_mod, freqs),
+                            x,
+                            use_reentrant=True,
                         )
                 else:
                     x = torch.utils.checkpoint.checkpoint(
-                        create_custom_forward(block),
-                        x, context, t_mod, freqs,
-                        use_reentrant=False,
+                        create_custom_forward(block, context, t_mod, freqs),
+                        x,
+                        use_reentrant=True,
                     )
             else:
                 x = block(x, context, t_mod, freqs)

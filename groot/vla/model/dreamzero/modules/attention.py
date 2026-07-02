@@ -16,24 +16,12 @@ except ModuleNotFoundError:
 
 import warnings
 
+from groot.vla.common.utils.device import gpu_supports_flash_attention, is_accelerator
 
 __all__ = [
     'flash_attention',
     'attention',
 ]
-
-
-def _gpu_supports_flash_attention():
-    """FlashAttention requires Ampere (compute capability 8.0) or newer."""
-    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
-        return False
-    try:
-        if not torch.cuda.is_available():
-            return False
-        cap = torch.cuda.get_device_capability()
-        return cap[0] >= 8
-    except Exception:
-        return False
 
 
 def _sdpa_attention_fallback(
@@ -95,10 +83,10 @@ def flash_attention(
     """
     half_dtypes = (torch.float16, torch.bfloat16)
     assert dtype in half_dtypes
-    assert q.device.type == 'cuda' and q.size(-1) <= 256
+    assert is_accelerator(q.device) and q.size(-1) <= 256
 
     # Use PyTorch SDPA on pre-Ampere GPUs (FlashAttention requires Ampere or newer)
-    if not _gpu_supports_flash_attention():
+    if not gpu_supports_flash_attention():
         return _sdpa_attention_fallback(
             q, k, v,
             q_lens=q_lens,

@@ -981,14 +981,13 @@ class LeRobotSingleDataset(Dataset):
                 for line in f:
                     episode_step_filter = json.loads(line)
                     trajectory_id = episode_step_filter["episode_index"]
-                    all_indices = np.arange(self.trajectory_lengths[trajectory_id].item())
+                    trajectory_index = self.get_trajectory_index(trajectory_id)
+                    all_indices = np.arange(self.trajectory_lengths[trajectory_index].item())
                     indices_to_filter = np.array(episode_step_filter["step_indices"])
                     step_filter[trajectory_id] = np.setdiff1d(all_indices, indices_to_filter)
         else:
-            for trajectory_id in self.trajectory_ids:
-                step_filter[trajectory_id] = np.arange(
-                    self.trajectory_lengths[trajectory_id].item()
-                )
+            for trajectory_id, traj_length in zip(self.trajectory_ids, self.trajectory_lengths):
+                step_filter[trajectory_id] = np.arange(traj_length.item())
         return step_filter
 
     def _get_metadata(self) -> DatasetMetadata:

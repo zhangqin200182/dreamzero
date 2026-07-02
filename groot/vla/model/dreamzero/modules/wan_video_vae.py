@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from groot.vla.common.utils.device import DEVICE
+
 CACHE_T = 2
 
 
@@ -1050,8 +1052,8 @@ class WanVideoVAE(nn.Module):
             2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
             3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
         ]
-        self.mean = torch.tensor(mean, device='cuda')
-        self.std = torch.tensor(std, device='cuda')
+        self.mean = torch.tensor(mean, device=DEVICE)
+        self.std = torch.tensor(std, device=DEVICE)
         self.scale = [self.mean, 1.0 / self.std]
 
         # init model
@@ -1362,8 +1364,8 @@ class WanVideoVAE38(WanVideoVAE):
             0.5709, 0.6065, 0.6415, 0.4944, 0.5726, 1.2042, 0.5458, 1.6887,
             0.3971, 1.0600, 0.3943, 0.5537, 0.5444, 0.4089, 0.7468, 0.7744
         ]
-        self.mean = torch.tensor(mean, device='cuda')
-        self.std = torch.tensor(std, device='cuda')
+        self.mean = torch.tensor(mean, device=DEVICE)
+        self.std = torch.tensor(std, device=DEVICE)
         self.scale = [self.mean, 1.0 / self.std]
 
         # init model
