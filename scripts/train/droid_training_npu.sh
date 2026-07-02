@@ -1,5 +1,5 @@
 #!/bin/bash
-# DreamZero DROID Training Script for Ascend NPU
+# DreamZero DROID Training Script for Ascend NPU (8-card FSDP + LoRA)
 #
 # Usage:
 #   bash scripts/train/droid_training_npu.sh
@@ -8,20 +8,20 @@
 #   - DROID dataset at DROID_DATA_ROOT
 #   - Wan2.1-I2V-14B-480P weights at WAN_CKPT_DIR
 #   - umt5-xxl tokenizer at TOKENIZER_DIR
-#   - DreamZero-AgiBot checkpoint at ./checkpoints/DreamZero-AgiBot (optional)
 
 export HYDRA_FULL_ERROR=1
-
-# Force NPU device (set before any torch import)
 export DREAMZERO_DEVICE=npu
+export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:512
 
 # ============ USER CONFIGURATION ============
 DROID_DATA_ROOT=${DROID_DATA_ROOT:-"./data/droid_lerobot"}
 OUTPUT_DIR=${OUTPUT_DIR:-"./checkpoints/dreamzero_droid_npu"}
 NUM_GPUS=${NUM_GPUS:-8}
-
+MAX_STEPS=${MAX_STEPS:-100000}
+SAVE_STEPS=${SAVE_STEPS:-1000}
 WAN_CKPT_DIR=${WAN_CKPT_DIR:-"./checkpoints/Wan2.1-I2V-14B-480P"}
 TOKENIZER_DIR=${TOKENIZER_DIR:-"./checkpoints/umt5-xxl"}
+FSDP_CONFIG=${FSDP_CONFIG:-"/workspace/fsdp_config_v27.json"}
 # =============================================
 
 # Auto-download weights
@@ -38,19 +38,18 @@ if [ ! -d "$DROID_DATA_ROOT" ]; then
     exit 1
 fi
 
-echo "=== NPU Training Configuration ==="
+echo "=== NPU FSDP Training Configuration ==="
 echo "NUM_GPUS:       $NUM_GPUS"
 echo "DATA_ROOT:      $DROID_DATA_ROOT"
 echo "OUTPUT_DIR:     $OUTPUT_DIR"
+echo "MAX_STEPS:      $MAX_STEPS"
+echo "SAVE_STEPS:     $SAVE_STEPS"
 echo "WAN_CKPT:       $WAN_CKPT_DIR"
 echo "Device:         $DREAMZERO_DEVICE"
-echo "Dist Backend:   hccl (auto-patched from nccl)"
-echo "DeepSpeed:      DISABLED (using DDP for LoRA)"
+echo "Dist Backend:   hccl"
+echo "Strategy:       FSDP full_shard auto_wrap"
+echo "FSDP Config:    $FSDP_CONFIG"
 echo "=================================="
-
-# NOTE: DeepSpeed ZeRO-2 is removed because LoRA training has very small
-# optimizer states. Plain DDP is sufficient and avoids NPU compatibility issues.
-# The device.py monkey-patch auto-corrects backend="nccl" → "hccl" on NPU.
 
 torchrun --nproc_per_node $NUM_GPUS --standalone \
     groot/vla/experiment/experiment.py \
@@ -69,16 +68,16 @@ torchrun --nproc_per_node $NUM_GPUS --standalone \
     num_state_per_block=1 \
     seed=42 \
     training_args.learning_rate=1e-4 \
-    save_steps=1000 \
     training_args.warmup_ratio=0.05 \
     output_dir=$OUTPUT_DIR \
     per_device_train_batch_size=1 \
-    max_steps=10 \
+    max_steps=$MAX_STEPS \
+    save_steps=$SAVE_STEPS \
     weight_decay=1e-5 \
     save_total_limit=10 \
     upload_checkpoints=false \
     bf16=true \
-    tf32=true \
+    tf32=false \
     eval_bf16=true \
     dataloader_pin_memory=false \
     dataloader_num_workers=1 \
@@ -87,7 +86,10 @@ torchrun --nproc_per_node $NUM_GPUS --standalone \
     save_lora_only=true \
     max_chunk_size=4 \
     frame_seqlen=880 \
-    save_strategy=no \
+    save_strategy=steps \
+    "training_args.fsdp=full_shard auto_wrap" \
+    training_args.fsdp_transformer_layer_cls_to_wrap=CausalWanAttentionBlock \
+    training_args.fsdp_config=$FSDP_CONFIG \
     droid_data_root=$DROID_DATA_ROOT \
     dit_version=$WAN_CKPT_DIR \
     text_encoder_pretrained_path=$WAN_CKPT_DIR/models_t5_umt5-xxl-enc-bf16.pth \
