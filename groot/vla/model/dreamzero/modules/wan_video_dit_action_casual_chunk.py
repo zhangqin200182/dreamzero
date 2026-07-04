@@ -2146,7 +2146,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block, **kwargs),
                     x,
-                    use_reentrant=True,
+                    use_reentrant=False,
                 )
             else:
                 x, _kv_cache = block(x, **kwargs)
