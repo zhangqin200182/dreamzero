@@ -13,9 +13,17 @@ export HYDRA_FULL_ERROR=1
 export DREAMZERO_DEVICE=npu
 export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:512
 
+# HCCL config for single-node multi-die
+export HCCL_CONNECT_TIMEOUT=1800
+export HCCL_EXEC_TIMEOUT=1800
+export HCCL_BUFFSIZE=128
+
+# NOTE: If Dataloader Bus error (shared memory exhausted), restart container
+# with --shm-size=16g, then change dataloader_num_workers back to 1.
+
 # ============ USER CONFIGURATION ============
-DROID_DATA_ROOT=${DROID_DATA_ROOT:-"./data/droid_lerobot"}
-OUTPUT_DIR=${OUTPUT_DIR:-"./checkpoints/dreamzero_droid_npu"}
+DROID_DATA_ROOT=${DROID_DATA_ROOT:-"/data/droid"}
+OUTPUT_DIR=${OUTPUT_DIR:-"/data/droid/checkpoints/dreamzero_droid_npu"}
 NUM_GPUS=${NUM_GPUS:-8}
 MAX_STEPS=${MAX_STEPS:-100000}
 SAVE_STEPS=${SAVE_STEPS:-1000}
@@ -87,7 +95,7 @@ torchrun --nproc_per_node $NUM_GPUS --standalone \
     max_chunk_size=4 \
     frame_seqlen=880 \
     save_strategy=steps \
-    "training_args.fsdp=full_shard auto_wrap" \
+    training_args.fsdp=full_shard\ auto_wrap \
     training_args.fsdp_transformer_layer_cls_to_wrap=CausalWanAttentionBlock \
     training_args.fsdp_config=$FSDP_CONFIG \
     droid_data_root=$DROID_DATA_ROOT \

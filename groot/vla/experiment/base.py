@@ -339,6 +339,13 @@ class BaseTrainer(transformers.Trainer):
         self.global_rank = int(os.environ.get("RANK", "0"))
         self.node_rank = int(os.environ.get("NODE_RANK", "0"))
 
+        # NPU: bind each rank to its own device so HCCL can distinguish
+        # ranks on different physical NPUs.  Must happen before FSDP wraps
+        # the model, otherwise tensors end up on the wrong device.
+        if self.world_size > 1:
+            import torch_npu
+            torch_npu.npu.set_device(self.local_rank)
+
         # Get distributed info
         self.current_step = 0
 
@@ -376,6 +383,54 @@ class BaseTrainer(transformers.Trainer):
         if self.args.fsdp:
             return
         super()._move_model_to_device(model, device)
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        """Override HF Trainer._load_from_checkpoint to skip full model weight loading.
+
+        The base model (14B params) is already loaded from pretrained_model_path
+        during create_trainer().  Calling model.load_state_dict() with the full
+        checkpoint would all-gather 14B params via FSDP → OOM on NPU (~60 MiB free).
+
+        Instead we:
+        1. Restore trainer state (global_step, epoch, log_history)
+        2. Load LoRA adapter weights from adapter_model.safetensors (~152 KB, safe)
+        Optimizer/scheduler states are restored separately by HF's _load_optimizer_and_scheduler.
+        """
+        import json
+        from transformers.trainer import (
+            TRAINER_STATE_NAME, WEIGHTS_NAME, WEIGHTS_INDEX_NAME,
+            SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME,
+        )
+
+        checkpoint_dir = resume_from_checkpoint
+
+        # --- 1. Restore trainer state (step counter, log history, etc.) ---
+        state_path = os.path.join(checkpoint_dir, TRAINER_STATE_NAME)
+        if os.path.isfile(state_path):
+            self.state = TrainerState.load_from_json(state_path)
+            mprint(f"Loaded trainer state from {state_path} (global_step={self.state.global_step})")
+
+        # --- 2. Load LoRA adapter weights ---
+        # The base model weights are already loaded from pretrained_model_path.
+        # But LoRA adapters (created with random init during model construction)
+        # must be restored from the checkpoint to preserve training progress.
+        adapter_path = os.path.join(checkpoint_dir, "adapter_model.safetensors")
+        if os.path.isfile(adapter_path):
+            from safetensors.torch import load_file
+            sd = load_file(adapter_path)
+            # Strip .base_layer. prefix (PEFT internal) if present
+            sd = {k.replace(".base_layer.", "."): v for k, v in sd.items()}
+            missing, unexpected = model.load_state_dict(sd, strict=False)
+            mprint(f"Loaded LoRA adapter: {len(sd)} keys from {adapter_path}")
+            if missing:
+                mprint(f"  Missing keys (first 5): {list(missing)[:5]}")
+            if unexpected:
+                mprint(f"  Unexpected keys (first 5): {list(unexpected)[:5]}")
+        else:
+            mprint(f"No adapter_model.safetensors in {checkpoint_dir} "
+                   "(LoRA adapters will remain at random init)")
+
+        mprint(f"Resumed from {checkpoint_dir} (skipped full model weight load)")
 
     def _get_train_sampler(self):
         return BaseSampler(self.train_dataset, shuffle=True, seed=self.args.seed)
@@ -552,16 +607,40 @@ class BaseTrainer(transformers.Trainer):
         if self.is_deepspeed_enabled:
             state_dict = self.accelerator.get_state_dict(self.deepspeed)
         else:
-            state_dict = self.model.state_dict()
+            # NPU fix: FSDP state_dict() all-gathers full 14B params to NPU.
+            # With 55+ GiB reserved by the caching allocator (even though only
+            # ~8.5 GiB is allocated), clone() fails with OOM for lack of
+            # contiguous free memory.  Fix: free the allocator cache first,
+            # then offload the gathered state_dict to CPU.
+            import gc
+            from groot.vla.common.utils.device import empty_cache
+            from torch.distributed.fsdp import FullyShardedDataParallel as _FSDP
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+            gc.collect()
+            empty_cache()
+
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with _FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, save_policy):
+                state_dict = self.model.state_dict()
 
         if self.base_cfg.save_lora_only:
-            # Save only the trainable parameters
-            train_key = [k for k, v in self.model.named_parameters() if v.requires_grad]
-            lora_state_dict = {k: v for k, v in self.model.state_dict().items() if k in train_key}
-            state_dict = lora_state_dict
+            # Use PEFT's native method to extract LoRA adapter weights from the
+            # CPU-offloaded full state_dict.  PEFT knows exactly which keys are
+            # LoRA adapters via the peft_config, avoiding fragile regex matching
+            # that previously captured only 3/2117 keys.
+            from peft.utils.save_and_load import get_peft_model_state_dict
+            lora_sd = get_peft_model_state_dict(self.model, state_dict=state_dict)
+            mprint(f"Saving {len(lora_sd)} LoRA keys to checkpoint (step={self.state.global_step})")
 
-        if self.args.should_save:
-            ret = self.model.save_pretrained(output_dir, state_dict=state_dict)
+            from safetensors.torch import save_file
+            os.makedirs(output_dir, exist_ok=True)
+            save_file(lora_sd, os.path.join(output_dir, "adapter_model.safetensors"))
+
+            # Also save trainer state so we can resume later
+            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+
+            ret = output_dir
 
             # can separately save the VLM model for downstream evalualtion
             if self.base_cfg.save_llm:
@@ -595,11 +674,6 @@ class BaseTrainer(transformers.Trainer):
                     f"No valid checkpoint found in output directory ({self.args.output_dir})"
                 )
 
-        if resume_from_checkpoint is not None:
-            # In case of repeating the find_executable_batch_size, set `self._train_batch_size` properly
-            self.state = TrainerState.load_from_json(
-                os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
-            )
         return super().train(resume_from_checkpoint, trial, ignore_keys_for_eval, **kwargs)
 
     def get_train_dataloader(self) -> DataLoader:

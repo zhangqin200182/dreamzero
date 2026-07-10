@@ -7,35 +7,64 @@ Compares two inference modes per checkpoint:
 
 Output per checkpoint:
   eval/step_{N}/
-    full/ep_{id}_video.png     ← video denoising frames
     full/ep_{id}_action.png    ← action trajectory plot
     action_only/ep_{id}_action.png
     comparison.png             ← side-by-side: full vs action_only action trajectories
     summary.json               ← {mode: {action_mse, inference_time_sec}}
 """
-import os, json, time, argparse
+import os, sys, json, time, argparse
 import numpy as np
+
+os.environ["DREAMZERO_DEVICE"] = "npu"
+
+# torch.compile requires triton drivers only available under torchrun multi-process.
+# In single-process eval, disable it globally so that post_initialize()'s
+# @torch.compile calls become no-ops.
 import torch
+torch._dynamo.config.disable = True
+
+# Init distributed (required by model creation — HCCL backend)
+import torch.distributed as dist
+for k, v in [("MASTER_ADDR", "localhost"), ("MASTER_PORT", "29501"),
+             ("RANK", "0"), ("WORLD_SIZE", "1"), ("LOCAL_RANK", "0")]:
+    os.environ.setdefault(k, v)
+if not dist.is_initialized():
+    dist.init_process_group(backend="hccl")
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-os.environ["DREAMZERO_DEVICE"] = "npu"
+
+def _reset_model_state(ah):
+    """Reset inference state so inference starts fresh for a new sample.
+
+    lazy_joint_video_action is stateful — current_start_frame and language
+    track position across incremental calls.  Reset them before each sample.
+    """
+    ah.current_start_frame = 0
+    ah.language = None
+    ah.clip_feas = None
+    ah.ys = None
+    ah.kv_cache1 = None
+    ah.kv_cache_neg = None
+    ah.crossattn_cache = None
+    ah.crossattn_cache_neg = None
 
 
 def load_checkpoint(checkpoint_path):
-    """Load LoRA checkpoint and return model + metadata."""
+    """Load LoRA checkpoint and return model + config."""
     from omegaconf import OmegaConf
-    from groot.vla.experiment.experiment import VLAExperiment
     from groot.vla.common.utils.device import DEVICE
 
-    # Load config
-    exp_dir = os.path.dirname(os.path.dirname(checkpoint_path))
+    # --- Load config ---
+    # checkpoint-200 is one level inside the experiment dir
+    exp_dir = os.path.dirname(checkpoint_path)
     cfg_dir = os.path.join(exp_dir, "experiment_cfg")
     cfg_file = None
     for root, dirs, files in os.walk(cfg_dir):
         for f in files:
-            if f == "config.yaml":
+            if f in ("config.yaml", "conf.yaml"):
                 cfg_file = os.path.join(root, f)
                 break
 
@@ -44,104 +73,171 @@ def load_checkpoint(checkpoint_path):
     else:
         raise FileNotFoundError(f"No config found in {cfg_dir}")
 
-    exp = VLAExperiment(cfg)
-    exp.setup_model_for_eval()
+    # --- Instantiate model ---
+    from hydra.utils import instantiate
+    model = instantiate(cfg.model)
+    model.eval()
+    model.to(DEVICE)
 
-    # Load LoRA weights
+    # --- Post-initialize ---
+    # Moves text_encoder, image_encoder, vae to NPU, sets dtype to bfloat16,
+    # and optionally torch.compile's them (no-op since dynamo is disabled).
+    model.post_initialize()
+
+    # --- Load LoRA weights ---
     from safetensors.torch import load_file
     adapter_file = os.path.join(checkpoint_path, "adapter_model.safetensors")
+    if not os.path.exists(adapter_file):
+        raise FileNotFoundError(f"No adapter_model.safetensors found in {checkpoint_path}")
+
     state_dict = load_file(adapter_file)
-    missing, unexpected = exp.model.load_state_dict(state_dict, strict=False)
-    print(f"Loaded checkpoint: {len(state_dict)} keys, {len(missing)} missing, {len(unexpected)} unexpected")
+    # Strip .base_layer. prefix (PEFT internal) if present
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_state_dict[k.replace(".base_layer.", ".")] = v
 
-    exp.model.eval()
-    exp.model.to(DEVICE)
-    return exp, cfg
+    missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
+    print(f"Loaded checkpoint: {len(state_dict)} keys, "
+          f"{len(missing)} missing, {len(unexpected)} unexpected")
+    if missing:
+        print(f"  Missing keys (first 5): {missing[:5]}")
+    if unexpected:
+        print(f"  Unexpected keys (first 5): {unexpected[:5]}")
 
-
-def load_episode_sample(data_root, ep_idx):
-    """Load one episode's data."""
-    import pandas as pd
-    from decord import VideoReader
-
-    with open(os.path.join(data_root, "meta", "info.json")) as f:
-        info = json.load(f)
-
-    chunk = ep_idx // info["chunks_size"]
-    parquet_path = os.path.join(data_root, f"data/chunk-{chunk:03d}", f"episode_{ep_idx:06d}.parquet")
-    if not os.path.exists(parquet_path):
-        return None
-
-    df = pd.read_parquet(parquet_path)
-
-    cameras = ['exterior_image_1_left', 'exterior_image_2_left', 'wrist_image_left']
-    all_frames = []
-    for cam in cameras:
-        video_path = os.path.join(data_root, "videos", f"chunk-{chunk:03d}", cam, f"episode_{ep_idx:06d}.mp4")
-        if os.path.exists(video_path):
-            vr = VideoReader(video_path)
-            frames = vr.get_batch(range(len(vr))).asnumpy()
-            all_frames.append(frames)
-
-    sample = {
-        "video": np.stack(all_frames, axis=0) if all_frames else None,  # (V, T, H, W, C)
-        "state": np.stack(df["observation.state"].values),
-        "action": np.stack(df["action"].values),
-        "task": str(df["annotation.language.language_instruction"].iloc[0]),
-        "embodiment_id": 0,
-    }
-    return sample
+    return model, cfg
 
 
-def run_inference_full(model, sample, cfg):
-    """Full inference: joint video + action denoising."""
+def load_samples_from_dataset(cfg, max_samples=5, seed=42):
+    """Load properly formatted samples using the training dataset pipeline."""
+    from hydra.utils import instantiate
+
+    ds = instantiate(cfg.train_dataset)
+    np.random.seed(seed)
+    it = iter(ds)
+    samples = []
+    for _ in range(max_samples):
+        try:
+            samples.append(next(it))
+        except StopIteration:
+            break
+    print(f"Loaded {len(samples)} samples from dataset")
+    return samples
+
+
+def run_inference_full(model, sample):
+    """Full inference: joint video + action denoising (causal, stateful)."""
     from groot.vla.common.utils.device import DEVICE
+    from groot.vla.model.dreamzero.transform.dreamzero_cotrain import HuggingfaceTokenizer
 
-    inputs = prepare_model_input(sample, cfg)
+    ah = model.action_head
+    _reset_model_state(ah)
+
+    # Build input dict from transformed sample
+    tk = HuggingfaceTokenizer(name="/checkpoints/umt5-xxl", seq_len=512, clean='whitespace')
+    txt = sample.get("text", "") or ""
+    ids, amask = tk([txt], return_mask=True)
+    neg_ids, neg_mask = tk([""], return_mask=True)
+
+    inp = {
+        "images": sample["images"],
+        "state": sample["state"],
+        "action": sample["action"],
+        "text": ids,
+        "text_attention_mask": amask,
+        "text_negative": neg_ids,
+        "text_attention_mask_negative": neg_mask,
+        "embodiment_id": sample["embodiment_id"],
+        "has_real_action": sample.get("has_real_action", True),
+        "action_mask": sample.get("action_mask", torch.ones(len(sample["action"]), 32)),
+    }
+
+    # Move to device, add batch dim
+    _skip_unsqueeze = {"text", "text_attention_mask", "text_negative", "text_attention_mask_negative"}
+    for k in list(inp.keys()):
+        v = inp[k]
+        if isinstance(v, torch.Tensor):
+            inp[k] = v.to(DEVICE) if k in _skip_unsqueeze else v.unsqueeze(0).to(DEVICE)
+        elif isinstance(v, np.ndarray):
+            if v.ndim == 0:
+                inp[k] = torch.tensor([v.item()], device=DEVICE)
+            else:
+                inp[k] = torch.from_numpy(v).unsqueeze(0).to(DEVICE)
+        elif isinstance(v, (int, float, bool, np.integer, np.floating, np.bool_)):
+            inp[k] = torch.tensor([int(v) if isinstance(v, (bool, np.bool_)) else v], device=DEVICE)
+
+    # Truncate state tokens to match model expectation
+    if inp["state"].shape[1] > ah.model.num_state_per_block:
+        inp["state"] = inp["state"][:, -ah.model.num_state_per_block:]
+
     with torch.no_grad():
         with torch.autocast(device_type="npu", dtype=torch.bfloat16):
             t0 = time.time()
-            output = model.module.get_action(inputs)
+            output = model.lazy_joint_video_action_causal(inp)
             elapsed = time.time() - t0
+
     return output, elapsed
 
 
-def run_inference_action_only(model, sample, cfg):
+def run_inference_action_only(model, sample):
     """Action-only inference: skip video denoising, predict action directly."""
     from groot.vla.common.utils.device import DEVICE
+    from groot.vla.model.dreamzero.transform.dreamzero_cotrain import HuggingfaceTokenizer
 
-    inputs = prepare_model_input(sample, cfg)
-    with torch.no_grad():
-        with torch.autocast(device_type="npu", dtype=torch.bfloat16):
-            t0 = time.time()
-            # Try action-only path if model supports it
-            if hasattr(model.module, 'get_action_only'):
-                output = model.module.get_action_only(inputs)
-            else:
-                # Fallback: use full inference but measure action accuracy only
-                output = model.module.get_action(inputs)
-            elapsed = time.time() - t0
-    return output, elapsed
+    ah = model.action_head
+    _reset_model_state(ah)
 
+    # Build input dict (same as full mode)
+    tk = HuggingfaceTokenizer(name="/checkpoints/umt5-xxl", seq_len=512, clean='whitespace')
+    txt = sample.get("text", "") or ""
+    ids, amask = tk([txt], return_mask=True)
+    neg_ids, neg_mask = tk([""], return_mask=True)
 
-def prepare_model_input(sample, cfg):
-    """Convert raw sample to model input format."""
-    import torch
-
-    video = torch.from_numpy(sample["video"]).float() / 255.0  # (V, T, H, W, C)
-    video = video.permute(1, 0, 2, 3, 4)  # (T, V, H, W, C)
-    video = video.unsqueeze(0)  # (B=1, T, V, H, W, C)
-
-    state = torch.from_numpy(sample["state"]).float()
-    action = torch.from_numpy(sample["action"]).float()
-
-    return {
-        "video": video,
-        "state": state,
-        "action": action,
-        "annotation.language.language_instruction": sample["task"],
+    inp = {
+        "images": sample["images"],
+        "state": sample["state"],
+        "action": sample["action"],
+        "text": ids,
+        "text_attention_mask": amask,
+        "text_negative": neg_ids,
+        "text_attention_mask_negative": neg_mask,
         "embodiment_id": sample["embodiment_id"],
+        "has_real_action": sample.get("has_real_action", True),
+        "action_mask": sample.get("action_mask", torch.ones(len(sample["action"]), 32)),
     }
+
+    _skip_unsqueeze = {"text", "text_attention_mask", "text_negative", "text_attention_mask_negative"}
+    for k in list(inp.keys()):
+        v = inp[k]
+        if isinstance(v, torch.Tensor):
+            inp[k] = v.to(DEVICE) if k in _skip_unsqueeze else v.unsqueeze(0).to(DEVICE)
+        elif isinstance(v, np.ndarray):
+            if v.ndim == 0:
+                inp[k] = torch.tensor([v.item()], device=DEVICE)
+            else:
+                inp[k] = torch.from_numpy(v).unsqueeze(0).to(DEVICE)
+        elif isinstance(v, (int, float, bool, np.integer, np.floating, np.bool_)):
+            inp[k] = torch.tensor([int(v) if isinstance(v, (bool, np.bool_)) else v], device=DEVICE)
+
+    if inp["state"].shape[1] > ah.model.num_state_per_block:
+        inp["state"] = inp["state"][:, -ah.model.num_state_per_block:]
+
+    # Enable action-only mode: decouple inference noise + skip video denoising
+    saved_decouple = ah.config.decouple_inference_noise
+    saved_final_noise = ah.config.video_inference_final_noise
+    ah.config.decouple_inference_noise = True
+    ah.config.video_inference_final_noise = 1.0
+
+    try:
+        with torch.no_grad():
+            with torch.autocast(device_type="npu", dtype=torch.bfloat16):
+                t0 = time.time()
+                output = model.lazy_joint_video_action_causal(inp)
+                elapsed = time.time() - t0
+    finally:
+        ah.config.decouple_inference_noise = saved_decouple
+        ah.config.video_inference_final_noise = saved_final_noise
+
+    return output, elapsed
 
 
 def save_action_plot(gt, pred, output_path, title="Action Prediction"):
@@ -228,69 +324,60 @@ def main():
     torch.manual_seed(args.seed)
 
     print(f"Loading {args.checkpoint}...")
-    exp, cfg = load_checkpoint(args.checkpoint)
-    model = exp.model
+    model, cfg = load_checkpoint(args.checkpoint)
 
-    # Load validation episodes
-    val_file = os.path.join(args.data_root, "meta", "val_episodes.json")
-    if os.path.exists(val_file):
-        with open(val_file) as f:
-            val_episodes = json.load(f)
-    else:
-        with open(os.path.join(args.data_root, "meta", "episodes.jsonl")) as f:
-            all_eps = [json.loads(l)["episode_index"] for l in f]
-        val_episodes = list(np.random.choice(all_eps, min(500, len(all_eps)), replace=False))
-        with open(val_file, "w") as f:
-            json.dump(val_episodes, f)
-        print(f"Created validation set: {len(val_episodes)} episodes")
+    # Load samples from dataset (properly formatted by training pipeline)
+    samples = load_samples_from_dataset(cfg, max_samples=args.num_samples, seed=args.seed)
+    if len(samples) == 0:
+        print("ERROR: No samples loaded from dataset")
+        return
 
-    selected = np.random.choice(val_episodes, min(args.num_samples, len(val_episodes)), replace=False)
     results = []
     full_dir = os.path.join(args.output_dir, "full")
     ao_dir = os.path.join(args.output_dir, "action_only")
     os.makedirs(full_dir, exist_ok=True)
     os.makedirs(ao_dir, exist_ok=True)
 
-    for i, ep_idx in enumerate(selected):
+    for i, sample in enumerate(samples):
         print(f"\n{'='*50}")
-        print(f"Sample {i+1}/{len(selected)}: Episode {ep_idx}")
-        sample = load_episode_sample(args.data_root, ep_idx)
-        if sample is None:
-            print(f"  Skip ep {ep_idx} - failed to load")
-            continue
+        print(f"Sample {i+1}/{len(samples)}")
 
-        gt_action = sample.get("action")
-        result = {"episode": int(ep_idx), "gt_action": gt_action}
+        gt = sample["action"].float().numpy() if hasattr(sample["action"], 'numpy') else np.asarray(sample["action"])
+        result = {"episode": i, "gt_action": gt}
 
         # ----- Mode 1: Full inference -----
         print("  [Full] Joint video+action denoising...")
         try:
-            output_full, time_full = run_inference_full(model, sample, cfg)
-            full_pred = output_full.get("predicted_action")
+            output_full, time_full = run_inference_full(model, sample)
+            full_pred = output_full["action_pred"][0].cpu().float().numpy()
             result["full_pred"] = full_pred
             result["full_time"] = time_full
-            result["full_mse"] = compute_action_mse(gt_action, full_pred)
-            save_action_plot(gt_action, full_pred,
-                             os.path.join(full_dir, f"action_ep{ep_idx:06d}.png"),
-                             f"Full Denoising - Episode {ep_idx}")
+            result["full_mse"] = compute_action_mse(gt, full_pred)
+            save_action_plot(gt, full_pred,
+                             os.path.join(full_dir, f"action_ep{i:02d}.png"),
+                             f"Full Denoising - Episode {i}")
             print(f"    Action MSE: {result['full_mse']:.6f}, Time: {time_full:.1f}s")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"    Full inference failed: {e}")
             result["full_pred"] = None
 
         # ----- Mode 2: Action-only inference -----
         print("  [Action-Only] Skipping video denoising...")
         try:
-            output_ao, time_ao = run_inference_action_only(model, sample, cfg)
-            ao_pred = output_ao.get("predicted_action")
+            output_ao, time_ao = run_inference_action_only(model, sample)
+            ao_pred = output_ao["action_pred"][0].cpu().float().numpy()
             result["action_only_pred"] = ao_pred
             result["action_only_time"] = time_ao
-            result["action_only_mse"] = compute_action_mse(gt_action, ao_pred)
-            save_action_plot(gt_action, ao_pred,
-                             os.path.join(ao_dir, f"action_ep{ep_idx:06d}.png"),
-                             f"Action-Only - Episode {ep_idx}")
+            result["action_only_mse"] = compute_action_mse(gt, ao_pred)
+            save_action_plot(gt, ao_pred,
+                             os.path.join(ao_dir, f"action_ep{i:02d}.png"),
+                             f"Action-Only - Episode {i}")
             print(f"    Action MSE: {result['action_only_mse']:.6f}, Time: {time_ao:.1f}s")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"    Action-only inference failed: {e}")
             result["action_only_pred"] = None
 
@@ -300,8 +387,8 @@ def main():
     if len(results) > 0:
         save_comparison_plot(results, os.path.join(args.output_dir, "comparison.png"))
 
-        full_mses = [r["full_mse"] for r in results if r.get("full_mse") is not None]
-        ao_mses = [r["action_only_mse"] for r in results if r.get("action_only_mse") is not None]
+        full_mses = [r["full_mse"] for r in results if r.get("full_mse") is not None and r["full_mse"] != float('inf')]
+        ao_mses = [r["action_only_mse"] for r in results if r.get("action_only_mse") is not None and r["action_only_mse"] != float('inf')]
         full_times = [r["full_time"] for r in results if r.get("full_time") is not None]
         ao_times = [r["action_only_time"] for r in results if r.get("action_only_time") is not None]
 
@@ -322,10 +409,14 @@ def main():
 
         print(f"\n{'='*50}")
         print("SUMMARY")
-        print(f"  Full:        MSE={summary['full']['action_mse_mean']:.6f}, Time={summary['full']['time_mean_sec']:.1f}s")
-        print(f"  Action-Only: MSE={summary['action_only']['action_mse_mean']:.6f}, Time={summary['action_only']['time_mean_sec']:.1f}s")
-        if full_mses and ao_mses:
-            delta = (summary['action_only']['action_mse_mean'] - summary['full']['action_mse_mean']) / summary['full']['action_mse_mean'] * 100
+        fmse = summary['full']['action_mse_mean']
+        ftime = summary['full']['time_mean_sec']
+        amse = summary['action_only']['action_mse_mean']
+        atime = summary['action_only']['time_mean_sec']
+        print(f"  Full:        MSE={'N/A' if fmse is None else f'{fmse:.6f}'}, Time={'N/A' if ftime is None else f'{ftime:.1f}s'}")
+        print(f"  Action-Only: MSE={'N/A' if amse is None else f'{amse:.6f}'}, Time={'N/A' if atime is None else f'{atime:.1f}s'}")
+        if full_mses and ao_mses and fmse and amse and fmse > 0:
+            delta = (amse - fmse) / fmse * 100
             print(f"  Delta: {delta:+.1f}% (action_only vs full)")
 
     print(f"\nDone! Output: {args.output_dir}")
