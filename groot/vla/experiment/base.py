@@ -625,12 +625,15 @@ class BaseTrainer(transformers.Trainer):
                 state_dict = self.model.state_dict()
 
         if self.base_cfg.save_lora_only:
-            # Use PEFT's native method to extract LoRA adapter weights from the
-            # CPU-offloaded full state_dict.  PEFT knows exactly which keys are
-            # LoRA adapters via the peft_config, avoiding fragile regex matching
-            # that previously captured only 3/2117 keys.
-            from peft.utils.save_and_load import get_peft_model_state_dict
-            lora_sd = get_peft_model_state_dict(self.model, state_dict=state_dict)
+            # Extract LoRA adapter weights from the CPU-offloaded full state_dict.
+            # Filter by key name containing "lora_" — the PEFT wrappers inside
+            # action_head.model add lora_A/lora_B parameters with this prefix.
+            # We cannot use get_peft_model_state_dict(self.model, ...) because
+            # self.model is FSDP-wrapped and has no .peft_config attribute.
+            lora_sd = {}
+            for k, v in state_dict.items():
+                if 'lora_' in k:
+                    lora_sd[k] = v
             mprint(f"Saving {len(lora_sd)} LoRA keys to checkpoint (step={self.state.global_step})")
 
             from safetensors.torch import save_file
@@ -656,6 +659,11 @@ class BaseTrainer(transformers.Trainer):
 
             return ret
 
+    def _save_optimizer_and_scheduler(self, output_dir):
+        if self.base_cfg.save_lora_only:
+            return
+        super()._save_optimizer_and_scheduler(output_dir)
+
     def train(
         self,
         resume_from_checkpoint=None,
@@ -667,6 +675,7 @@ class BaseTrainer(transformers.Trainer):
         if resume_from_checkpoint is False:
             resume_from_checkpoint = None
 
+        # resolve "True" to the actual latest checkpoint path
         if isinstance(resume_from_checkpoint, bool) and resume_from_checkpoint:
             resume_from_checkpoint = get_last_checkpoint(self.args.output_dir)
             if resume_from_checkpoint is None:
@@ -674,6 +683,16 @@ class BaseTrainer(transformers.Trainer):
                     f"No valid checkpoint found in output directory ({self.args.output_dir})"
                 )
 
+        if resume_from_checkpoint is not None:
+            # In case of repeating the find_executable_batch_size, set batch size properly
+            self.state = TrainerState.load_from_json(
+                os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
+            )
+            # Model weights were already loaded during create_trainer().
+            # Passing a path to super().train() would make HF Trainer call
+            # _load_from_checkpoint(), which triggers FSDP unshard → NPU OOM.
+            # Suppress by passing None (trainer_state.json already restored above).
+            resume_from_checkpoint = None
         return super().train(resume_from_checkpoint, trial, ignore_keys_for_eval, **kwargs)
 
     def get_train_dataloader(self) -> DataLoader:
@@ -782,16 +801,26 @@ class BaseExperiment(ABC):
             )
 
         # Check if we are resuming training.
-        resume_path, continue_training = get_checkpoint_path(training_args.output_dir)
-        if not continue_training:
-            print(f"Models is ready under {training_args.output_dir}. Skip training.")
-            exit(0)
+        # Priority: 1) env var, 2) config key, 3) auto-detect from output_dir
+        resume_path = os.environ.get("RESUME_CKPT")
         if resume_path:
-            print(f"Resuming training from {resume_path}")
-            resume_from_checkpoint = True
+            print(f"Resuming training from env RESUME_CKPT: {resume_path}")
+            resume_from_checkpoint = resume_path
+        elif cfg.get("resume_from_checkpoint", None) not in (None, "", False):
+            resume_path = cfg.resume_from_checkpoint
+            print(f"Resuming training from explicit path: {resume_path}")
+            resume_from_checkpoint = resume_path
         else:
-            # First time training.
-            resume_from_checkpoint = False
+            resume_path, continue_training = get_checkpoint_path(training_args.output_dir)
+            if not continue_training:
+                print(f"Models is ready under {training_args.output_dir}. Skip training.")
+                exit(0)
+            if resume_path:
+                print(f"Resuming training from {resume_path}")
+                resume_from_checkpoint = True
+            else:
+                # First time training.
+                resume_from_checkpoint = False
 
         # Instantiate the model.
         model = self.create_model(cfg, training_args)
