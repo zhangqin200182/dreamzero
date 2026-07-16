@@ -44,4 +44,5 @@ torchrun --nproc_per_node 16 --standalone \
     text_encoder_pretrained_path=/checkpoints/Wan2.1-I2V-14B-480P/models_t5_umt5-xxl-enc-bf16.pth \
     image_encoder_pretrained_path=/checkpoints/Wan2.1-I2V-14B-480P/models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth \
     vae_pretrained_path=/checkpoints/Wan2.1-I2V-14B-480P/Wan2.1_VAE.pth \
-    tokenizer_path=/checkpoints/umt5-xxl
+    tokenizer_path=/checkpoints/umt5-xxl \
+    "$@"

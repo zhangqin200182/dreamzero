@@ -402,6 +402,9 @@ class BaseTrainer(transformers.Trainer):
             SAFE_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME,
         )
 
+        if model is None:
+            model = self.model
+
         checkpoint_dir = resume_from_checkpoint
 
         # --- 1. Restore trainer state (step counter, log history, etc.) ---
@@ -688,10 +691,18 @@ class BaseTrainer(transformers.Trainer):
             self.state = TrainerState.load_from_json(
                 os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
             )
-            # Model weights were already loaded during create_trainer().
-            # Passing a path to super().train() would make HF Trainer call
-            # _load_from_checkpoint(), which triggers FSDP unshard → NPU OOM.
-            # Suppress by passing None (trainer_state.json already restored above).
+            # CRITICAL: actually load the LoRA adapter weights so training truly
+            # continues from the checkpoint. We do it HERE, before super().train()
+            # runs accelerator.prepare()/FSDP-wraps the model, so the loaded
+            # weights are preserved through wrapping. Our _load_from_checkpoint
+            # override only touches the LoRA adapter (no 14B unshard, no OOM).
+            #
+            # We still pass resume_from_checkpoint=None to super().train():
+            # passing the path would make HF's FSDP resume path look for the
+            # intentionally-unsaved pytorch_model_fsdp.bin (FileNotFoundError) and
+            # try to load the FSDP optimizer state (NPU OOM). get_train_dataloader
+            # already reset the data seed from self.state.global_step above.
+            self._load_from_checkpoint(resume_from_checkpoint, model=self.model)
             resume_from_checkpoint = None
         return super().train(resume_from_checkpoint, trial, ignore_keys_for_eval, **kwargs)
 
