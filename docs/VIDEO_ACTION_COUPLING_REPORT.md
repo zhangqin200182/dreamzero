@@ -13,7 +13,36 @@
 
 ---
 
-## 二、实验汇总
+## 二、DreamZero AO 模式的本质
+
+在深入实验之前，需要理解 DreamZero 的 AO（Action-Only）模式究竟做了什么。
+
+DreamZero 使用共享 DiT——video tokens 和 action tokens 无法物理分离。AO 模式通过配置 `decouple_inference_noise=True` + `video_inference_final_noise=1.0` 实现，其机制是：
+
+```python
+sigma_max = sample_scheduler.sigmas[0]  # = 1.0
+video_final_noise = 1.0
+
+# 重映射：所有 sigma 卡在 1.0
+sample_scheduler.sigmas = sigmas * (1.0 - 1.0) / 1.0 + 1.0
+                        = sigmas * 0 + 1.0
+                        = 1.0  # 16 步完全相同！
+```
+
+**AO 模式下的 16 步去噪，每一步都是第一步的重复：**
+
+```
+Step 0:  scheduler.sigma=1.0 → DiT 中输入 video = 纯噪声 z₀
+Step 1:  scheduler.sigma=1.0 → DiT 中输入 video = 纯噪声 z₀ （相同！）
+...
+Step 15: scheduler.sigma=1.0 → DiT 中输入 video = 纯噪声 z₀ （相同！）
+```
+
+video latents 从未前进，16 次 DiT 计算中 video tokens 的 K/V 值完全不变。Action 的 queries 反复 attend 到同一组静态的 video keys。对 action 的贡献是纯 attention scaffold——不是"去噪过程"，是"video tokens 在场"。
+
+---
+
+## 三、实验汇总
 
 ### 实验 1：相关性分析（5 checkpoint × 20 样本）
 
@@ -45,6 +74,7 @@
 **结论**：往 flow_pred 注入噪声（即使 σ=1.0）完全不影响 action。去噪过程鲁棒。
 
 #### 2b. video latents 替换
+
 每步去噪后把 video latents 替换为纯噪声或全零。
 
 | 条件 | Action MSE | vs Full |
@@ -54,7 +84,35 @@
 | Zero latents | **18.75** | **-2.86** |
 | AO | 49.17 | +27.56 |
 
-**结论**：用纯噪声取代视频反而**改善了** action。视频去噪任务在共享 DiT 中与 action 竞争 attention 预算。去掉视频内容负担后，attention 全部分配给 action。
+**为什么 Fresh Random 比 AO 好？两者 video 都是纯噪声。**
+
+关键差异不在 video 是否去噪（两者都不去噪），而在 video tokens 的 K/V 值是否变化：
+
+```
+AO mode (sigma 始终=1.0, video=同一个 z₀):
+  Step 0:  action queries attend to K/V(z₀) → 静态
+  Step 1:  action queries attend to K/V(z₀) → 同组 keys
+  ...
+  Step 15: action queries attend to K/V(z₀) → 同组 keys
+  
+  → 16 步中 action 反复 attend 到同一组固定的 noise pattern
+  → 后 15 步的 attention 计算高度冗余
+  → action 逐渐"习惯"了这组静态 context，attention 多样性降低
+
+Fresh random (每步 video=新的 z_t):
+  Step 0:  action queries attend to K/V(z₀) → 随机
+  Step 1:  action queries attend to K/V(z₁) → 不同！
+  ...
+  Step 15: action queries attend to K/V(z₁₅) → 不同！
+  
+  → 每步 action 面对全新的 video K/V pattern
+  → attention 无法"习惯"，被迫每步做多样化的计算
+  → action denoising 受益于每步不同的 context
+```
+
+Action denoising 本身是逐步降噪的（action σ 从 1000 到 0），需要每一步有不同的 video context 来对齐。AO 给了它一个静态的 video anchor——像一个人对你反复说同一句话，16 次后你就不听了。Fresh random 每步换一句话——虽然每句话本身是 noise，但变化本身保持了你的注意力。
+
+这也解释了 Full（真实去噪）介于两者之间：视频在变化，但变化是平滑收敛的（噪声逐渐减少的同主题画面）。Fresh random 更极端的变化反而更"刺激"了 attention 机制的多样性，对 action 的间接帮助更大。
 
 #### 2c. 第一帧语义扰动（2 checkpoint 验证）
 模型在推理时只使用第一帧（通过 CLIP 编码），对第一帧做各种扰动。
@@ -92,7 +150,7 @@ action_loss AFTER:   2.33
 
 ---
 
-## 三、统一解释：推理解耦 ≠ 训练解耦
+## 四、统一解释：推理解耦 ≠ 训练解耦
 
 所有看似矛盾的实验结果可以用一个框架统一：
 
@@ -124,7 +182,7 @@ action_loss AFTER:   2.33
 
 ---
 
-## 四、对 RL 方案的影响
+## 五、对 RL 方案的影响
 
 ### 为什么视频 RL 可行
 
@@ -159,7 +217,7 @@ action_loss AFTER:   2.33
 
 ---
 
-## 五、下一步方向
+## 六、下一步方向
 
 ### 短期（验证）
 
@@ -180,7 +238,7 @@ action_loss AFTER:   2.33
 
 ---
 
-## 六、外部独立验证：Fast-WAM 论文 (arXiv:2603.16666)
+## 七、外部独立验证：Fast-WAM 论文 (arXiv:2603.16666)
 
 ### 论文概述
 
@@ -251,12 +309,12 @@ Wan2.1-I2V-14B (40层)              Wan2.2-TI2V-5B (30层)
 
 ---
 
-## 七、核心发现一句话
+## 八、核心发现一句话
 
 > **DreamZero 和 Fast-WAM 独立验证了同一个结论：视频通路对 Action 的帮助来自训练时共享表示的梯度耦合，而非推理时视频内容的语义理解。视频 RL 利用这个梯度耦合机制来间接改进 Action 是可行的。**
 
 
-## 八、下一步方向（更新）
+## 九、下一步方向（更新）
 
 ### 短期（验证）
 
