@@ -84,7 +84,105 @@ video loss ───→ 共享 DiT 权重 ←─── action     video_pred ─
 
 ---
 
-## 四、研究方向
+## 四、理论框架：Cross-Modal Latent Alignment via Attention-as-Predictor
+
+### 4.1 Attention 层 = 跨模态 Predictor
+
+我们的实验发现可以统一到一个框架下：**Attention 层本身就是跨模态的潜空间对齐机制**。
+
+```
+                              ┌──────────────────────────┐
+                              │   Shared Attention Space  │
+                              │   (40 层 DiT + mRoPE)     │
+                              │                          │
+  video ──→ VAE ──→ v_token ──┤                          ├──→ Head ──→ video_pred
+                              │   Q/K/V 跨模态对齐        │
+  action ─→ Encoder → a_token─┤                          ├──→ Decoder → action_pred
+                              │   "Attention = Predictor" │
+  text ───→ T5 ────→ t_token ─┤                          ├──→ (AR 输出)
+                              │                          │
+  audio ──→ Encoder → s_token─┤                          ├──→ Decoder → audio_pred
+                              └──────────────────────────┘
+```
+
+**核心洞察**：JEPA 需要一个显式的 Predictor 网络（通常是 MLP 或小型 Transformer）在潜空间中做预测。但在 DiT 架构中，**40 层 cross-attention 本身就是 Predictor**——它在每一层通过 Q/K/V 计算跨模态的 attention score，这是一个无参数的跨模态对齐机制。
+
+### 4.2 JEPA 对比：统一潜空间 vs 跨模态 Attention
+
+JEPA 追求的是**同模态统一潜空间**：
+```
+JEPA:
+  context blocks ──→ Encoder ──→ shared_latent ──→ Predictor ──→ shared_latent  ←── Encoder ←── target blocks
+  (可见 patch)                              (同空间)   (MLP/Transf)   (同空间)       (共享/EMA)     (被遮挡 patch)
+  
+  关键：x 和 y 是同一模态的不同部分
+       Encoder 共享（或 EMA），产生同一潜空间的表示
+       Predictor 在同一空间内做状态转移
+```
+
+我们的框架是**跨模态 Attention 对齐**：
+```
+Ours:
+  video token (VAE latent) ──→ Qv,Kv,Vv ──┐
+                                            ├── 联合 Attention ──→ 输出切回各自空间
+  action token (MLP latent) ─→ Qa,Ka,Va ──┘
+  
+  关键：video 和 action 是不同的模态
+       Encoder 各自独立（VAE vs MLP），潜空间完全不同
+       Attention 让它们在同一层"对话"，但不统一它们的潜空间
+```
+
+### 4.3 两种方案对比
+
+| | 统一潜空间（JEPA 追求） | 跨模态 Attention（我们的框架） |
+|---|---|---|
+| **对齐层次** | Encoder 层（压缩到统一维度） | Attention 层（Q/K/V 内积，无参数） |
+| **信息损失** | 大：video 56320-dim → 5120-dim 损失巨大 | 小：各模态保留自己的表示空间 |
+| **Encoder 压力** | 全部对齐压力在 Encoder | 分散到 40 层 attention，每层学一点 |
+| **预训练优势** | 无（Encoder 从随机开始） | **有**：DiT 预训练已经学会了视频 attention 模式 |
+| **推理分离性** | 紧耦合（统一空间内彼此交织） | **弱耦合**（attention 结束各自独立） |
+| **模态可扩展性** | 差：新模态 → 重新训练 Encoder | 好：新模态 → 加 token + expert |
+| **注意力对齐** | `Q·K^T` 无参数路由 | 同（无参数） |
+| **训练难度** | Encoder 承受全部对齐压力 | 40 层分布式对齐 + 预训练提供起点 |
+
+### 4.4 三个层次的对齐对应
+
+```
+JEPA 类型                     | 我们的对应
+─────────────────────────────────────────────────────
+Image JEPA:                  | DreamZero 第一帧
+  context → latent → target  | CLIP(第一帧) → attention → y_conditioning
+
+Video JEPA:                  | COSMOS 3 Forward Dynamics
+  past_frames → latent →      | frame_t + action_t → attention → frame_{t+1}
+  future_frames              | autoregressive rollout = video JEPA
+
+Multi-modal JEPA:            | FastWAM / COSMOS 3
+  (video, text) → latent →   | (video, language) → attention → (action, next_video)
+  (action, video)            | 跨模态对齐在同一个 attention 空间
+```
+
+### 4.5 我们的理论贡献：区分两种耦合
+
+```
+JEPA 框架下：
+  推理时（Token 层）：
+    video_token 的数值 ──✗──→ action_token 的数值
+    弱耦合。符合 JEPA——潜空间预测不需要像素重建。
+    跨模态 Attention 的"潜空间"是 attention pattern，
+    不是 token 值，所以 token 值改变不影响对齐。
+
+  训练时（梯度层）：
+    ∂L_video/∂W ──→ 共享权重 ←── ∂L_action/∂W
+    紧耦合。超出 JEPA 范围——JEPA 通常分开训练各组件。
+    共享权重的梯度互通是跨模态 Attention 的特有能力。
+```
+
+**这就是为什么"弱耦合推理 + 强耦合训练"可以同时成立**。JEPA 文献关注前者（避免像素重构），我们的 RL 方案利用后者（跨模态梯度传递）。两者是同一架构的不同侧面，互补而非矛盾。
+
+---
+
+## 五、研究方向
 
 ### 方向 1：弱耦合推理加速
 
@@ -162,7 +260,7 @@ COSMOS 3 闭环 RL 流程：
 
 ---
 
-## 五、实现路径
+## 六、实现路径
 
 ```
 Phase 1（已完成）: DreamZero 先导实验
@@ -189,7 +287,7 @@ Phase 4（综合）: 双方向整合
 
 ---
 
-## 六、分工建议
+## 七、分工建议
 
 | 方向 | 核心贡献 | 适合角色 |
 |------|---------|---------|
@@ -200,6 +298,6 @@ Phase 4（综合）: 双方向整合
 
 ---
 
-## 七、核心一句话
+## 八、核心一句话
 
-> **视频-动作耦合在训练时是紧的（梯度互通），在推理时是弱的（输出无关）。利用前者可以在想象中训练 action，利用后者可以加速推理。两者互补，构成完整的视频-action 联合优化框架。**
+> **跨模态 Attention 本身就是潜空间 Predictor——它在 token 层面做无参数对齐，在梯度层面做有参数耦合。推理时弱耦合（token 值无关），训练时强耦合（梯度互通）。前者用于推理加速，后者用于想象训练。这是 JEPA 在多模态场景下的自然推广。**
