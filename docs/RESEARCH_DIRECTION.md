@@ -17,7 +17,29 @@
 
 ### 1.1 COSMOS 3 的全共享架构：训练在一起的价值
 
-COSMOS 3 的 AR Reasoner 和 DiT Generator 使用**同一组 Transformer blocks、同一组 Q/K/V/FFN 权重**，仅 attention mask 不同（causal vs full）。这个设计不是偶然的——全共享参数在训练中产生四个层面的正迁移：
+COSMOS 3 的 AR Reasoner 和 DiT Generator 使用**同一组 Transformer blocks、同一组 Q/K/V/FFN 权重**，仅 attention mask 不同（causal vs full）。
+
+```
+                    COSMOS 3 全共享架构的训练知识迁移
+
+  AR 训练阶段                                 DiT Action 生成阶段
+  ┌─────────────────────────┐              ┌─────────────────────────┐
+  │ "pick up the blue cup"  │              │ Policy 模式:              │
+  │   → 蓝色杯子的视觉特征    │   共享权重    │ 处理同一段指令文本          │
+  │   → "抓取"的运动语义      │──────────→  │ 用的是同一套 W_Q/W_K/W_V   │
+  │   → 物体间空间关系        │  Q/K/V/FFN  │ 生成动作序列                │
+  │   → 物理合理性            │              │ [gripper_open,             │
+  │   → 时序因果关系          │              │  move_to(x,y,z),           │
+  │                         │              │  gripper_close]            │
+  └─────────────────────────┘              └─────────────────────────┘
+         ↑                                              │
+         │          DiT→AR 反向迁移                      │
+         └──────────────────────────────────────────────┘
+         Generator 在 latent space 中学到的连续动态
+         → 增强 Reasoner 的时序理解和物理判断
+```
+
+这个设计不是偶然的——全共享参数在训练中产生四个层面的正迁移：
 
 1. **语言理解 → 动作指令落地**。AR 模式的指令理解能力通过**同一套 Q 投影矩阵**直接用于 Action 生成。Policy 推理时，文本指令经过同一套 Q 投影矩阵编码为 Key/Value，这些 representation 在 AR 训练中已经被"教"会了什么是杯子、什么是蓝色、什么是放置。DiT 去噪时的 cross-attention 可以直接利用这些语义信息约束动作生成。没有共享权重的话，Generator 的 cross-attention 需要从零学语言理解。
 
@@ -38,10 +60,17 @@ COSMOS 3 的 AR Reasoner 和 DiT Generator 使用**同一组 Transformer blocks�
 FastWAM（Wan2.2-5B, 清华/上海 AI Lab, 2026.3）将 Video Expert（3072 dim, 30 层）和 Action Expert（1024 dim, 30 层）分离为独立的 Q/K/V/FFN，仅通过 Joint Self-Attention 在每层进行跨模态路由：
 
 ```
-Layer i:
-  Video Expert ──→ Q_v, K_v, V_v ──┐
-                                     ├── Joint Flash Attention ──→ split → 各自 o_proj → 各自 FFN
-  Action Expert ─→ Q_a, K_a, V_a ──┘
+                FastWAM 双 Expert 分离架构
+
+  训练时（共享 Attention）:              推理时（KV cache 分离）:
+  ┌───────────────────────┐            ┌───────────────────────┐
+  │ Video    Action       │            │ Video (1 次)           │
+  │ Q_v,K_v  Q_a,K_a     │            │ forward → K/V 缓存     │
+  │   └──┬───┘            │            │          ↓             │
+  │   Joint Attn          │            │ Action (N 步)          │
+  │   split → FFN_v/FFN_a │            │ 每步 forward Action     │
+  └───────────────────────┘            │ + O(1) 读缓存 K/V      │
+                                       └───────────────────────┘
 ```
 
 推理时分离执行：
@@ -169,11 +198,28 @@ AO 模式的进一步证据：AO 本质是 sigma 在 16 步中全部卡在 1.0�
 
 ---
 
-## 四、目标架构：训练共享 Attention + 推理 KV cache 分离
+## 四、目标架构：基于 Attention 路由的全模态多频率世界模型
 
 ### 4.1 架构设计
 
-三 Expert（LLM + Video + Action），每层通过 Joint Self-Attention 路由信息，各自独立 Q/K/V/FFN：
+三 Expert（LLM + Video + Action），每层通过 Joint Self-Attention 路由信息，各自独立 Q/K/V/FFN。
+
+```
+              三 Expert 分离架构 = COSMOS 3 的能力 + FastWAM 的效率
+
+  训练时（共享 Attention = 知识迁移）:    推理时（KV cache 分离 = 多频率）:
+  ┌────────────────────────────┐       ┌────────────────────────────┐
+  │ LLM    Video    Action     │       │ LLM (1 次, ~1Hz)           │
+  │ Q_l,K_l Q_v,K_v Q_a,K_a   │       │ forward → K_l 缓存          │
+  │   └──────┬──────┘          │       │          ↓                 │
+  │    Joint Flash Attention   │       │ Video (1 次, ~10Hz)        │
+  │    split → FFN_l/v/a       │       │ forward → K_v 缓存          │
+  │                            │       │          ↓                 │
+  │ AR→Action 知识迁移         │       │ Action (N 步, ~50Hz)       │
+  │ 语义/物理/视觉/CoT         │       │ 每步 Action Expert forward  │
+  │ + DiT→AR 动态直觉          │       │ + O(1) 读 K_l + K_v        │
+  └────────────────────────────┘       └────────────────────────────┘
+```
 
 ```
 Layer i:
@@ -194,13 +240,44 @@ Layer i:
       Block-causal mask（π₀ 已验证）：不存在 AR vs DiT 冲突
 ```
 
+```
+    三个架构的对比
+
+    COSMOS 3                    FastWAM                    三 Expert (目标)
+    全共享参数                    双 Expert 分离                三 Expert 分离
+    ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
+    │ AR ←→ DiT       │         │ Video ←→ Action │         │ LLM ←→ Video    │
+    │ 同一组 Q/K/V/FFN │         │ 独立 Q/K/V/FFN   │         │   ←→ Action     │
+    │                  │         │                  │         │ 独立 Q/K/V/FFN   │
+    │ ✓ 知识迁移       │         │ ✓ 推理分离       │         │ ✓ 知识迁移       │
+    │ ✗ 推理分离       │         │ ✓ 多频率         │         │ ✓ 推理分离       │
+    │ ✗ 多频率         │         │ ✗ 语义层         │         │ ✓ 多频率         │
+    │ ✗ 无害干扰       │         │ ✓ 无害干扰       │         │ ✓ 无害干扰       │
+    └─────────────────┘         └─────────────────┘         └─────────────────┘
+```
+
 ### 4.2 四个递进目标
 
 **目标 1：构建 Expert 分离架构。** 从 FastWAM（已有 Video + Action Expert 分离 + KV cache 基础设施）出发，演化到三 Expert。渐进策略：先加轻量 LLM（冻结 T5/CLIP），目标 1-3 验证后，如果 F5 成立再升级完整 AR LLM。LLM 升级是一个 gate decision。
 
 **目标 2：全模态能力不丢失。** 继承 COSMOS 3 的全部功能——Policy（LLM 理解指令 + Video/Action 联合去噪）、Forward Dynamics（首帧 + Action → 未来视频）、Inverse Dynamics（视频 → Action）、Reasoner（LLM 独立推理）——每种模式只用到需要的 Expert，无关 Expert 不参与，消除有害干扰。
 
-**目标 3：多频率执行。** LLM ~1Hz（任务理解，K_l 缓存）→ Video ~10Hz（视觉预测，K_v 缓存）→ Action ~50Hz（实时控制，仅 Action Expert forward + O(1) 读取缓存）。AR LLM 是多频率的关键收益——不是"跳过计算"，而是提供 T5/CLIP 无法实现的任务规划、空间推理、语义泛化。
+**目标 3：多频率执行。** 三 Expert 以各自独立频率运行：
+
+```
+        多频率执行金字塔
+
+  LLM Expert           ★               ★               ★
+  语义理解+任务规划      ↑ ~1 Hz（K_l 缓存复用，任务切换时刷新）
+
+  Video Expert         ★─★─★─★─★─★─★─★─★─★─★─★
+  视觉预测+世界模拟       ↑ ~10 Hz（K_v 缓存复用，画面变化时刷新）
+
+  Action Expert       ★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+  实时动作执行           ↑ ~50 Hz（每步仅 Action Expert forward + O(1) 读 K_l, K_v）
+```
+
+AR LLM 是多频率的关键收益——不是"跳过计算"，而是提供 T5/CLIP 无法实现的任务规划、空间推理、语义泛化。
 
 **目标 4：想象 RL 闭环。** Video Expert = 世界模型（FD rollout），LLM Expert = 语义裁判（Reasoner 判断任务完成），Action Expert = 被训练策略。闭环：LLM 理解任务 → Action 采样 N 条轨迹 → Video rollout → LLM 裁判打分 → GRPO 更新 Action。不需要真机、仿真器、GT action 标注。已有证据：DreamZero 实验 E（纯视频优化 -43.7%），待验证：FastWAM F5（Expert 分离中的强耦合）。
 
