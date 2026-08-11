@@ -541,16 +541,42 @@ DreamZero 位于谱的最左端（全共享 DiT），提供了最严格耦合条
 
 **预期结果**：P1 预期成立（π₀ 已有 prefix KV cache 的主动弱耦合证据）。P2 预期无害干扰（Expert 分离避免了共享权重的冲突）。**P0 完全未知——这是唯一的高风险实验。**
 
-#### 6.1.3 FastWAM 上的先导实验（Phase 2b，可选，2-3 周）
+#### 6.1.3 FastWAM 上的先导实验（Phase 2b，重要，3-4 周）
 
-FastWAM 位于谱的右端（Video + Action Expert 分离，纯 DiT）。作为 π₀ 的对照——验证 DiT-DiT 分离（而非 LLM-DiT 分离）的耦合属性。如果 π₀ 上 P0 不成立，在 FastWAM 上测试可以提供"是否是 DiT-DiT 的特殊性"的中间答案。
+FastWAM 的核心价值：它**已经实现了 Expert 分离 + 多频率推理的全部基础设施**：
 
-| 实验 | 验证假设 | 重要性 |
-|------|---------|--------|
-| P0': 梯度传播 | DiT-DiT Expert 分离中强耦合是否成立？ | π₀ P0 的对照——区分"LLM-DiT 分离" vs "DiT-DiT 分离" |
-| P2': Random 替换 | DiT-DiT Expert 分离中有害干扰？ | 验证有害干扰假说的跨架构一致性 |
+```
+prefill_video_cache:           forward_action_with_video_cache:
+  video tokens 1 次 forward      每步去噪仅 forward Action Expert
+  → 缓存 30 层 video K/V        → 读缓存的 video K/V
+  → O(视频参数) 仅算 1 次         → Action Inference 极轻量
+```
 
-**注：此阶段可选。如果 π₀ 上 P0 直接成立，可以跳过 FastWAM 验证直接进入 Phase 3。**
+这是三个平台中**唯一可以直接测试多频率执行效果的完整实现**。π₀ 有 prefix KV cache（LLM 1 次 + Action 10 步），但只有 2 Expert。FastWAM 同时具备 Expert 分离和多频率执行，是验证目标 3（多频率优势）的理想平台。
+
+##### 实验设计（主攻多频率）
+
+| 优先级 | 实验 | 方法 | 验证问题 | 对应目标 |
+|--------|------|------|---------|---------|
+| **F1 ★★★** | **多频率精度验证** | 对比 Full joint inference（30 步 video + 30 步 action）vs 分离推理（video 1 次 + action 30 步）的 Action MSE | 多频率分离执行是否等同于 Full joint？ | 目标 3 |
+| **F2 ★★★** | **频率鲁棒性** | 固定 video K/V 缓存 → 连续执行 50 步 Action 去噪 → 评测 Action MSE 是否随步数退化 | K/V 缓存的"保质期"有多长？多少步后需要刷新？ | 目标 3 |
+| **F3 ★★** | **刷新策略消融** | 对比"每 10 步刷新 video K/V" vs "每 5 步刷新" vs "从不刷新" | 最优的视频 K/V 刷新频率？刷新策略对延迟和精度的 trade-off | 目标 3 |
+| **F4 ★★** | **与 π₀ 对比** | 在相同 DROID 任务上，对比 FastWAM 分离推理 vs π₀ prefix cache 推理的 Action 精度 + 延迟 | DiT-DiT 分离 vs LLM-DiT 分离，多频率执行的效率对比 | 目标 3 |
+| **F5 ★** | 梯度传播 | 仅 backward video loss，测 Action 变化（平行 DreamZero 实验 D） | DiT-DiT Expert 分离中强耦合是否成立？ | π₀ P0 的对照 |
+| **F6 ★** | Random 替换 | 替换 video latent → 测 Action 变化（平行 DreamZero 实验 B） | DiT-DiT Expert 分离中有害干扰？ | 目标 1 |
+
+**F1-F4 是多频率目标的核心验证，F5-F6 是耦合属性的辅助验证。** 即使 π₀ P0 不成立，F1-F4 的结果也不受影响——它们只依赖弱耦合（已确认成立）。
+
+**为什么 FastWAM 是多频率最好的验证平台**：
+
+| | DreamZero | π₀ | FastWAM | COSMOS 3 |
+|---|---|---|---|---|
+| Expert 分离 | ✗ | ✓ | ✓ | ✗ |
+| KV cache 分离 | ✗ | ✓（LLM K/V） | ✓（Video K/V） | ✗ |
+| 多频率可测试 | ✗ | 部分（2 Expert） | **完全（2 Expert, 标准接口）** | ✗ |
+| 代码参考 | — | `pi0.py:233-278` | `mot.py:prefill_video_cache` | — |
+
+**FastWAM 是验证目标 3（多频率优势）的理想平台——不需要等待新架构搭建，可以直接在现有代码上跑实验。**
 
 #### 6.1.4 COSMOS 3 上的先导实验（Phase 2d，重要，6-8 周）
 
@@ -736,8 +762,13 @@ Phase 2a（3-4 周）: π₀ 先导实验（P0/P1/P2）
   P1 ★:   Prefix 扰动——验证目标 3（多频率）通用性
   P2 ★★:  Random 替换——验证目标 1（分离必要性）
   
-Phase 2b（可选，2-3 周）: FastWAM 对照实验（P0'/P2'）
-  → 如果 π₀ P0 直接成立可跳过
+Phase 2b（重要，3-4 周）: FastWAM 先导实验——多频率验证
+  F1 ★★★: 分离 vs 联合推理精度对比
+  F2 ★★★: K/V 缓存持久性（频率鲁棒性）
+  F3 ★★:  K/V 刷新策略消融
+  F4 ★★:  与 π₀ 多频率效率对比
+  F5-F6:   耦合属性辅助验证（梯度 + 有害干扰）
+  → 目标 3（多频率）的核心验证平台，不依赖 π₀ P0 结果
   
 Phase 2d（重要，6-8 周）: COSMOS 3 先导实验
   P3a ★★★: GRPO 工程可行性——GRPO 在 WAM 上的首次尝试
