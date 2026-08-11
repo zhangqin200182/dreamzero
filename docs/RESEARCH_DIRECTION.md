@@ -7,13 +7,15 @@
 
 ## 摘要
 
-未来多模态模型架构存在两种跨模态对齐的范式。
+未来多模态模型架构存在两种跨模态信息传递的范式。
 
-**范式 A（JEPA）**：通过 Encoder 将不同模态压缩到一个统一的隐空间，在此空间中进行对齐和预测。不同模态的表示在 Encoder 输出处被强制拉到同一向量空间。
+**范式 A（共享隐空间）**：通过 Encoder 将不同模态压缩到一个统一的隐空间——CLIP 的对比学习、多模态 LLM 的 projection layer、JEPA 的 shared latent——都在此范畴。不同模态的表示在 Encoder 输出处被强制拉到同一向量空间。这是**表示对齐**（representation alignment）。
 
-**范式 B（Attention 层对齐）**：不同模态保留独立的 Expert（各自的编码器、Q/K/V 投影、FFN），仅在 Attention 层通过 Q·K^T 内积建立跨模态连接。对齐发生在每一层的 Joint Self-Attention 中，不留存到下一层。
+**范式 B（Attention 层跨模态路由）**：不同模态保留独立的 Expert（各自的编码器、Q/K/V 投影、FFN），仅在 Attention 层通过 Q·K^T 内积进行信息路由。Attention 结束后各 Expert 回到独立表示空间。这是**信息路由**（information routing），不是表示对齐——各模态的表示从未被"拉到一起"，只是通过 softmax(QK^T) 有选择地传递信息。
 
-范式 B 已经被 π₀（LLM + Action Expert）、FastWAM（Video + Action Expert）、COSMOS 3（多模态 MoT）和 DreamZero（全共享 DiT）各自独立实现并验证。但尚未被明确识别为一种独立于 JEPA 的跨模态对齐范式。
+"对齐"和"路由"是两个正交的逻辑层次：JEPA/CLIP 通过对比学习或潜空间预测使不同模态的表示可互换，Attention 通过内积权重使不同模态的 token 互相传递信息。**前者改变表示空间，后者不改变。**
+
+范式 B 已经被 π₀、FastWAM、COSMOS 3 和 DreamZero 四个独立架构不约而同地实现。但尚未被明确识别为一种独立于共享隐空间的跨模态信息传递范式。
 
 我们通过 7 组因果实验在 DreamZero 上系统验证了范式 B 的关键属性：**推理弱耦合**（一个模态的输出质量不影响另一模态的预测精度）和**训练强耦合**（一个模态的损失函数梯度可以通过共享 Attention 传播到另一模态）。这两个属性在范式 A（统一隐空间）中不成立——统一空间中的表示彼此交织，推理时无法分离，训练时 Encoder 承受全部对齐压力。
 
@@ -23,24 +25,25 @@
 
 ## 一、背景：跨模态对齐的两种思路
 
-### 1.1 范式 A：统一隐空间（JEPA 路线）
+### 1.1 范式 A：共享隐空间（表示对齐）
 
 ```
-JEPA (Joint Embedding Predictive Architecture):
+共享隐空间方法（CLIP / 多模态 LLM projection / JEPA）：
 
-  modality A ──→ Encoder_A ──→ shared_latent ──→ Predictor ──→ shared_latent  ←── Encoder_B ←── modality B
-  (高维原始数据)   (压缩投影)     (统一向量空间)   (MLP/Transf)   (同空间预测)      (压缩投影)     (另一部分数据)
+  modality A ──→ Encoder_A ──→ shared_latent ──→ 在此空间中进行下游任务
+  modality B ──→ Encoder_B ──→ shared_latent
+  (不同模态)     (压缩/投影)    (统一向量空间)
 ```
 
-核心思想：不同模态（或同一模态的不同部分）被各自的 Encoder 压缩/扩展到同一个向量空间，在此空间中通过 Predictor 网络进行预测。I-JEPA（图像）、V-JEPA（视频）、Multi-modal JEPA 都遵循此范式。
+核心思想：通过 Encoder 将不同模态压缩/扩展到同一个向量空间，在此空间中表示可以直接比较（CLIP 的 cosine similarity）、直接拼接（多模态 LLM 的 token concat）或进行预测（JEPA 的潜空间预测）。
 
-**属性**：
-- 对齐靠 Encoder 的参数完成（Encoder 承受全部跨模态对齐压力）
-- 一旦进入统一空间，所有表示彼此交织——推理时无法分离
-- Encoder 的信息压缩带来信息损失（如 video 56320-dim → 5120-dim）
-- 统一的向量空间便于插值、可视化和迁移
+**关键属性**：
+- Encoder 承受全部跨模态对齐压力（通过对比学习、重建损失或预测损失训练）
+- 一旦进入统一空间，所有表示彼此交织——推理时**无法分离**
+- 信息压缩带来信息损失（如 video 56320-dim → 5120-dim）
+- 好处：统一空间便于跨模态检索、零样本迁移、表示可视化
 
-### 1.2 范式 B：Attention 层对齐（VLA → WAM 路线）
+### 1.2 范式 B：Attention 层跨模态路由（信息路由）
 
 ```
 Expert-Interleaved Self-Attention:
@@ -53,13 +56,23 @@ Expert-Interleaved Self-Attention:
                                    (Q·K^T 内积, 无参数)
 ```
 
-核心思想：不同模态保留独立的 Expert（各自的编码方式、各自的隐空间维度、各自的 Q/K/V/FFN 权重），仅在 Attention 层通过拼接 Q/K/V 和一次联合 Flash Attention 建立跨模态连接。对齐发生在 Attention 中——一个 Q·K^T 内积——不留存到 Attention 之外。
+核心思想：不同模态保留独立的 Expert（各自的编码方式、各自的隐空间维度、各自的 Q/K/V/FFN 权重），仅在 Attention 层通过 Q·K^T 内积进行**信息路由**——softmax(QK^T) 决定每个 token 从其他 Expert 获取多少信息。这不是表示对齐，各模态的表示在 Attention 前后始终留在各自空间中。
 
-**属性**：
-- 对齐靠 Attention 的 Q·K^T 内积完成（无参数跨模态路由）
-- Attention 结束后，各 Expert 回到各自的表示空间——推理时可以分离
-- 各模态保留独有表示空间，无信息损失
-- 可以利用各 Expert 的预训练权重（LLM 的 PaliGemma、Video 的 Wan2.2 等）
+**关键属性**：
+- 路由靠 Attention 的 Q·K^T 内积完成（无参数）
+- Attention 结束后，各 Expert 回到独立表示空间——推理时**可以分离执行**
+- 各模态保留独有表示空间，**无信息损失**
+- 可以利用各 Expert 的**预训练权重**（LLM 的 PaliGemma、Video 的 Wan2.2 等）
+
+**对齐 vs 路由的本质区别**：
+
+| | 表示对齐（范式 A） | 信息路由（范式 B） |
+|---|---|---|
+| **目标** | 使不同模态的表示可互换 | 使不同模态的 token 可互相传递信息 |
+| **机制** | Encoder 参数压缩/投影 | Attention Q·K^T 内积 |
+| **表示空间** | 改变（压缩到统一维度） | 不改变（各自独立空间） |
+| **逻辑层次** | 表示层 | 交互层 |
+| **关系** | 两者**正交**——可以同时使用 | COSMOS 3 的 3D mRoPE = 表示对齐 + 信息路由
 
 ### 1.3 范式 B 已被独立实现但未被识别
 
@@ -150,9 +163,9 @@ action_loss AFTER:   2.33
 
 **统一结论**：Video loss 的梯度通过共享 Attention 权重传播到 action。纯视频优化无需任何 action 标注或梯度，即可将 action loss 减半。
 
-### 3.3 关键 nuance：Expert 分离程度构成连续谱
+### 3.3 关键 nuance：Expert 分离的连续谱与逻辑不对称
 
-四个架构并非同质的"Expert 分离"，而是落在一条连续谱上（这一发现在 `RESEARCH_DIRECTION_REVIEW.md` 中被首次指出）：
+四个架构并非同质的"Expert 分离"，而是分布在一条连续谱上：
 
 ```
 全共享 ←────────────────────────────────────────────────→ 全分离
@@ -163,22 +176,27 @@ Q/K/V/FFN 全共享   Q/K/V/FFN 完全独立  Q/K/V/FFN 完全独立  独立 + �
                   (3072=3072)       仅 head_dim=256 对齐   gen 有独立 MoE router
 ```
 
-**这对实验结论的泛化有直接影响**：
-- DreamZero 是全共享架构，处于谱的最左端（耦合最紧）。我们的因果实验在此进行。
-- 将 DreamZero 的结论推广到整条谱时，"训练强耦合"的机制可能不同：在 DreamZero 中是**共享参数耦合**（Q/K/V/FFN 完全相同），在 Expert 分离架构中仅能通过 **Attention 的 Q·K^T 内积** 中的跨模态 score 间接传播梯度。
-- "推理弱耦合"则在 Expert 分离架构中**更强**（FastWAM/π₀/COSMOS 3 都主动跳过不需要的模态生成），而非更弱。
+**逻辑不对称（review v2 指出）**：文档从 DreamZero（最左端）推断整个谱的行为。这个逻辑对**弱耦合**成立（共享参数下输出质量都不传递 → 分离参数下更不传递）。但对**强耦合**不成立——DreamZero 的强耦合来自共享参数（Q/K/V/FFN 完全相同），在 Expert 分离架构中，梯度路径完全不同：
 
-### 3.4 实验 B 反直觉结果的重新解释
+```
+DreamZero:  video_loss → ∂/∂(shared_QKV) → 直接影响 action（实验 D/E 验证）
+FastWAM:    video_loss → ∂/∂(video_QKV) → [仅通过 softmax 中的 video_Q·action_K^T] → ∂/∂(action_K)
+π₀:         LLM_loss →  [仅通过 softmax 中的 LLM_Q·action_K^T] → ∂/∂(action_K)
+```
 
-Random/zero latent → action 改善 13%，可能不是因为"attention 多样性"（我们最初的理解），而是因为**共享 Q/K/V 权重同时服务两种 denoising 动态**产生了有害表示偏移：
+在分离架构中，梯度仅通过 attention score 矩阵中的跨模态项传播——这是一条**间接且可能极弱的路径**。
 
-- Video 使用 `Beta(3,1)` 分布采样 sigma（偏向低噪声），Action 使用 `Uniform` 分布
-- 共享 Q/K/V 需要同时服务两种不同的噪声水平 → video token 在 attention 中产生的 K/V 对 action 的 denoising 路径形成干扰
-- 用 random latent 替换 video → 意外消除了这种干扰 → action 改善
+**结论**：推理弱耦合是已验证的通用属性，训练强耦合的泛化边界是当前框架中**最高优先级的待验证假设**。
 
-如果这个解释成立，意味着 Expert 分离不仅是优化选择，而是**防止模态间有害干扰的必要架构设计**。这是一个比"弱耦合推理加速"更强的 motivation。此假说需要在 Expert 分离架构（FastWAM 或 π₀）上验证：在 Expert 分离架构中做同样的 video latent 替换实验，预期**不会**看到 action 改善（因为不存在有害干扰需要消除）。
+### 3.4 实验 B 的重新解释：有害干扰假说
 
-### 3.5 这两种属性在范式 A 中不成立
+Random/zero latent 替换 → action 改善 13%。代码级解释（`RESEARCH_DIRECTION_REVIEW.md` v2）：DreamZero 使用独立 per-token noise schedule——Video: `Beta(3,1)`（偏低压噪声），Action: `Uniform`。共享的 Q/K/V 权重需要同时服务两种不同的 denoising 动态 → 两种冲突的降噪目标在 attention 中相互干扰 → video latent 对 action token 产生有害表示偏移。Random/zero latent 意外消除了这种冲突。
+
+**如果这个解释成立，Expert 分离不是可选的优化，而是防止模态间有害干扰的必要架构设计。** 这可能比"弱耦合推理加速"更强——它不依赖"训练强耦合是否泛化"的实验结果，仅从推理时行为就能证明 Expert 分离的架构优势。
+
+**P2 验证实验**：在 Expert 分离架构（FastWAM/π₀）中做相同替换。预测：不会看到 action 改善，因为本身没有有害干扰需要消除。
+
+### 3.5 这两种属性在共享隐空间中均不成立
 
 ```
                      范式 A (统一隐空间)              范式 B (Attention 对齐)
@@ -256,9 +274,9 @@ Layer i (共 N 层):
 
 ---
 
-## 五、为什么 Attention 对齐是更优的范式
+## 五、为什么 Attention 路由是更优的跨模态信息传递方案
 
-| | 范式 A: 统一隐空间 | 范式 B: Attention 对齐 |
+| | 范式 A: 共享隐空间（表示对齐） | 范式 B: Attention 路由（信息路由） |
 |---|---|---|
 | **对齐机制** | Encoder 参数压缩 | Q·K^T 内积（无参数） |
 | **信息损失** | 有（到统一维度） | 无（各保留独立空间） |
@@ -309,8 +327,8 @@ Phase 3（6-8 周）: 三专家架构原型
   - 需注意 generation paradigm 冲突（AR LLM vs Diffusion Video）
     参考 COSMOS 3 的 two_way_attention 解决方案
 
-Phase 4（8-12 周）: 想象 RL 训练
-  - COSMOS 3 上实现 GRPO 训练管线
+Phase 4（12-16 周）: 想象 RL 训练
+  - COSMOS 3 上实现 GRPO 训练管线（从零构建——目前仅有 SFT 配方，需预留充分工程时间）
   - Reasoner-based reward + FD rollout
 
 Phase 5（综合）: 论文撰写
