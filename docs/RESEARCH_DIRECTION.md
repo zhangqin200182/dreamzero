@@ -94,25 +94,26 @@ JEPA (Joint Embedding Predictive Architecture):
 四个架构并非同质的"Attention 路由"，而是分布在一条连续谱上：
 
 ```
-全共享 ←──────────────────────────────────────────────────────→ 全分离
+全共享 ←──────────────────────────────────────────────→ 全分离
 
-DreamZero         FastWAM            π₀                COSMOS 3
-│                 │                  │                  │
-Q/K/V/FFN 全共享   Q/K/V/FFN 完全独立  Q/K/V/FFN 完全独立  Q/K/V/FFN 独立
-仅 token 类型区分   head_dim 强制对齐    width 不同         不同 attention mode
-                  (3072=3072)       仅 head_dim=256 对齐  (causal vs full)
-                                                       gen 有独立 MoE router
-
-在谱上的位置:     偏左（共享）                       偏右（分离）         ?
+COSMOS 3          DreamZero        FastWAM            π₀
+│                 │                 │                  │
+同一组 blocks      全共享 DiT        独立 Q/K/V/FFN     独立 Q/K/V/FFN
+AR 和 DiT         仅 token 类型区分  2 Expert MoT       2 Expert LLM
+共享 Q/K/V/FFN     video+action     30 层              18 层
+仅 attention mask  在同一 DiT 内     仅 head_dim 对齐    仅 head_dim 对齐
+不同 (causal vs full)
+│                 │                 │                  │
+最左端             偏左              偏右                最右端
 ```
 
-**COSMOS 3 的位置是开放问题**：它同时具备共享特征（同一组 Transformer blocks 用于 AR 和 DiT 两种模式）和分离特征（不同 mode、不同 attention mask、gen tower 的独立 MoE router）。它可能恰好落在谱的中间，兼具两端的优势；也可能因为模式切换而引入了新的复杂性。**它的确切位置需要代码级分析来确认，这是谱上最有趣的未定点。**
+**COSMOS 3 是最左端——全共享。** AR Reasoner 和 DiT Generator 使用**同一组 Transformer blocks、同一组 Q/K/V/FFN 权重**。区别仅在 attention mask（causal vs full）。这与 DreamZero 的本质相同——都是共享参数——只是共享的粒度不同：COSMOS 3 是不同 mode 共享同一组 blocks，DreamZero 是 video 和 action token 共享同一组 blocks。
 
 **这个谱对架构选择有直接影响**：
 
 - **偏左（共享）**：参数效率高，训练强耦合（梯度通过共享参数传播）。但存在有害干扰风险——我们在 DreamZero 上观察到全共享架构中 video denoising 对 action 产生有害表示偏移。
 - **偏右（分离）**：推理可分离（弱耦合），各模态独立优化。但训练耦合的强度未知——梯度仅通过 Attention score 矩阵中的跨模态项传播，路径间接。
-- **最优位置在哪里？** 可能在中间某个点（COSMOS 3 的位置？），既保留训练耦合又提供推理分离。
+- **最优位置在哪里？** 目前左侧（COSMOS 3、DreamZero）已验证训练强耦合但存在有害干扰风险，右侧（FastWAM、π₀）已实现推理分离但训练耦合的泛化性未知。**最优解可能不在极端——但 COSMOS 3 在左端的事实意味着它也无法避免全共享的有害干扰风险。**
 
 ### 2.2 维度二：主干类型（VLM / DiT / 双模）
 
@@ -177,9 +178,9 @@ Q/K/V/FFN 全共享   Q/K/V/FFN 完全独立  Q/K/V/FFN 完全独立  Q/K/V/FFN 
 
 基于已有证据，Attention 路由路线下的最优架构应具备：
 
-**1. 适当的 Expert 分离**：全共享存在有害干扰风险（实验 B），最优位置可能不在谱的极左端。COSMOS 3 的位置是一个关键参考——如果它的共享 blocks + 分离 mode 设计恰好平衡了训练耦合和推理分离，就是最优点。
+**1. 适当的 Expert 分离**：全共享架构（COSMOS 3 和 DreamZero 都在谱的左端）存在有害干扰风险（实验 B）。如果 P2 在 Expert 分离架构中验证了无害干扰，则最优位置必然在谱的右侧移动。**这意味着 COSMOS 3 的全共享设计可能不是最优解——它无法避免我们在 DreamZero 上观察到的模态间有害干扰。**
 
-**2. 双模统一**：VLM 的语义理解（低频）+ DiT 的视觉预测（中频）+ Action 独立执行（高频）。COSMOS 3 已有双模，但尚未验证频率分离的精度影响。
+**2. 双模统一与 Expert 分离的组合**：COSMOS 3 证明了双模统一可以在全共享架构中实现。未来的问题是：能否在 Expert 分离架构中实现双模统一？即 AR Reasoner 和 DiT Generator 各自独立的 Expert，通过 Joint Attention 交互，同时支持多频率分离执行。
 
 **3. 多频率执行**：利用推理弱耦合，LLM ~1Hz、Video ~10Hz、Action ~50Hz。FastWAM 的 video KV cache 和 π₀ 的 prefix KV cache 已验证可行。
 
@@ -194,7 +195,7 @@ Q/K/V/FFN 全共享   Q/K/V/FFN 完全独立  Q/K/V/FFN 完全独立  Q/K/V/FFN 
 | **P0** | π₀ 梯度传播 | 强耦合是否泛化到 Expert 分离架构？ | **论文 ceiling** |
 | **P1** | π₀ prefix 扰动 | 弱耦合是否泛化到 VLA 架构？ | 范式通用性 |
 | **P2** | FastWAM/π₀ random latent 替换 | Expert 分离中是否存在有害干扰？ | Expert 分离的必要性 |
-| **P3** | COSMOS 3 耦合分析 | 双模架构中的耦合程度？+ COSMOS 3 谱定位 | 最优谱位置 |
+| **P3** | COSMOS 3 耦合分析 | 全共享双模架构中是否存在 DreamZero 同款有害干扰？ | COSMOS 3 全共享的代价 |
 
 ```
 Phase 1（已完成）: DreamZero 先导实验 + 理论框架
@@ -208,4 +209,4 @@ Phase 3: 架构原型或论文撰写（取决于 P0）
 
 ## 六、总结
 
-> 机器人世界模型的跨模态交互有两种范式：JEPA 的潜空间对齐，和 WAM/VLA 的 Attention 路由。后者已被四个独立架构不约而同地实现，但其内在属性——推理弱耦合、训练强耦合（的泛化边界）、Expert 分离的最优位置、VLM+DiT 双模统一——仍在探索中。本文识别了这些开放问题，并规划了回答它们的实验路线。
+> 机器人世界模型的跨模态交互有两种范式：JEPA 的潜空间对齐，和 WAM/VLA 的 Attention 路由。后者已被四个架构实现——COSMOS 3 和 DreamZero 位于谱的左端（全共享），FastWAM 和 π₀ 位于谱的右端（Expert 分离）。全共享架构存在有害干扰风险（实验 B），Expert 分离架构的训练耦合泛化性待验证（P0）。未来架构的核心问题是：在 Attention 路由的框架下，双模统一（VLM+DiT）能否在 Expert 分离架构中实现？最优的 Expert 分离程度在哪里？这是我们正在回答的问题。
