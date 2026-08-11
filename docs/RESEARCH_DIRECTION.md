@@ -487,7 +487,7 @@ Layer i:
 - COSMOS 3 的 Reasoner 可做语义级别判断
 
 **待验证**：
-- P0：在 Expert 分离架构中训练强耦合是否仍然成立（π₀ 梯度传播实验）
+- P0：在 Expert 分离架构中训练强耦合是否仍然成立（FastWAM F5 梯度传播实验）
 - 如果 P0 成立 → GRPO 梯度可从 Video reward 通达 Action Expert
 - 如果 P0 不成立 → 需要保留部分共享参数以维持梯度路径，或使用交替训练策略
 
@@ -529,17 +529,11 @@ DreamZero 位于谱的最左端（全共享 DiT），提供了最严格耦合条
 
 **产出**：全共享架构的完整属性画像 + 有害干扰假说 + 实验方法论（可复用到 π₀/FastWAM）。
 
-#### 6.1.2 π₀ 上的先导实验（Phase 2a，3-4 周）
+#### 6.1.2 π₀ 的角色
 
-π₀ 位于谱的右端（LLM + Action Expert 分离），验证 Expert 分离架构的耦合属性。**优先级最高——P0 的结果决定整个项目的天花板。**
+π₀ 不需要独立的先导实验阶段。LLM→Action 的梯度路径在 π₀ 的联合训练中天然成立（否则 π₀ 本身无法训练），P0 不适用。π₀ prefix 扰动（P1）和 harmful interference（P2）可以在架构搭建阶段顺带验证。
 
-| 实验 | π₀ 平行 | 验证假设 | 重要性 |
-|------|---------|---------|--------|
-| **P0: 梯度传播** | 平行 D/E | 训练强耦合是否泛化到 Expert 分离？仅 backward LLM loss 或 video loss，测 Action 变化 | **决定目标 4（RL 闭环）的可行性** |
-| **P1: Prefix 扰动** | 平行 A/C | 弱耦合在 VLA 架构中是否成立？扰动 LLM prefix，测 Action 精度 | 支持目标 3（多频率） |
-| **P2: Random 替换** | 平行 B | Expert 分离中是否存在有害干扰？替换 Action Expert 的 latent，测 Action 精度 | 支持目标 1（分离必要性） |
-
-**预期结果**：P1 预期成立（π₀ 已有 prefix KV cache 的主动弱耦合证据）。P2 预期无害干扰（Expert 分离避免了共享权重的冲突）。**P0 完全未知——这是唯一的高风险实验。**
+**π₀ 的核心价值是作为三 Expert 架构的起点**（路线 A）——π₀ 已有的代码基础设施（JAX/PyTorch、DROID fine-tune 配方、prefix KV cache 推理策略）可以直接复用，加 Video Expert 即可组装三 Expert 原型。
 
 #### 6.1.3 FastWAM 上的先导实验（Phase 2b，重要，3-4 周）
 
@@ -562,10 +556,10 @@ prefill_video_cache:           forward_action_with_video_cache:
 | **F2 ★★★** | **频率鲁棒性** | 固定 video K/V 缓存 → 连续执行 50 步 Action 去噪 → 评测 Action MSE 是否随步数退化 | K/V 缓存的"保质期"有多长？多少步后需要刷新？ | 目标 3 |
 | **F3 ★★** | **刷新策略消融** | 对比"每 10 步刷新 video K/V" vs "每 5 步刷新" vs "从不刷新" | 最优的视频 K/V 刷新频率？刷新策略对延迟和精度的 trade-off | 目标 3 |
 | **F4 ★★** | **与 π₀ 对比** | 在相同 DROID 任务上，对比 FastWAM 分离推理 vs π₀ prefix cache 推理的 Action 精度 + 延迟 | DiT-DiT 分离 vs LLM-DiT 分离，多频率执行的效率对比 | 目标 3 |
-| **F5 ★** | 梯度传播 | 仅 backward video loss，测 Action 变化（平行 DreamZero 实验 D） | DiT-DiT Expert 分离中强耦合是否成立？ | π₀ P0 的对照 |
-| **F6 ★** | Random 替换 | 替换 video latent → 测 Action 变化（平行 DreamZero 实验 B） | DiT-DiT Expert 分离中有害干扰？ | 目标 1 |
+| **F5 ★★★** | **梯度传播** | 仅 backward video loss，测 Action 变化（平行 DreamZero 实验 D） | **DiT-DiT Expert 分离中强耦合是否成立？** ← 这是真正的 P0 | **决定目标 4（RL 闭环）的可行性** |
+| **F6 ★★** | Random 替换 | 替换 video latent → 测 Action 变化（平行 DreamZero 实验 B） | DiT-DiT Expert 分离中有害干扰？ | 目标 1 |
 
-**F1-F4 是多频率目标的核心验证，F5-F6 是耦合属性的辅助验证。** 即使 π₀ P0 不成立，F1-F4 的结果也不受影响——它们只依赖弱耦合（已确认成立）。
+**F1-F4 是多频率目标的核心验证，F5（梯度传播）是整个项目的 P0——决定目标 4（RL 闭环）的可行性，F6 验证有害干扰假说。** F1-F4 的结果不依赖 F5 结果——它们只依赖弱耦合（已确认成立）。
 
 **为什么 FastWAM 是多频率最好的验证平台**：
 
@@ -602,23 +596,23 @@ COSMOS 3 是**目前唯一具备完整闭环基础设施的平台**：Policy（�
 | COSMOS 3 全共享架构中 GRPO 能否改善 action（平行确认实验 E） | — |
 | 全共享的有害干扰是 DreamZero 特有还是系统性问题 | — |
 
-**即使 P3a/P3b/P3c 成功，P0 仍然是独立的需要验证的假设。** COSMOS 3 的结果可以证明"想象 RL 的工程可行 + Reasoner reward 有效 + 全共享中已验证"，但 Expert 分离架构中的梯度路径仍然需要 π₀ P0 实验来确认。
+**即使 P3a/P3b/P3c 成功，P0 仍然是独立的需要验证的假设。** COSMOS 3 的结果可以证明"想象 RL 的工程可行 + Reasoner reward 有效 + 全共享中已验证"，但 Expert 分离架构中的梯度路径仍然需要 FastWAM F5 来确认。
 
 ##### 务实计划
 
-COSMOS 3 GRPO 和 π₀ P0 可以**并行推进**——不互相依赖。两者的结果在 Phase 4 汇合：
+COSMOS 3 GRPO 和 FastWAM F5 可以**并行推进**——不互相依赖。两者的结果在 Phase 4 汇合：
 
 ```
 Phase 2d（COSMOS 3）: GRPO pipeline + Reasoner validation + harmful interference
-Phase 2a（π₀）:      P0 gradient propagation + P1 perturbation + P2 harmful interference
+Phase 2a（FastWAM）:  多频率 F1-F4 + 梯度耦合 F5 + 有害干扰 F6
 
 ↓ 两者并行，无依赖 ↓
 
 Phase 4: 
-  → 如果 π₀ P0 成立 + COSMOS GRPO pipeline 可行
+  → 如果 FastWAM F5 成立 + COSMOS GRPO pipeline 可行
     → 三 Expert 架构 + GRPO → 完整的想象 RL 验证
-  → 如果 π₀ P0 不成立但 COSMOS GRPO pipeline 可行
-    → 想象 RL 仅在共享架构中有效（全共享 vs Expert 分离的定位调整）
+  → 如果 FastWAM F5 不成立但 COSMOS GRPO pipeline 可行
+    → 强耦合仅限于全共享 → 以目标 1-3 撰写论文
 ```
 
 ---
@@ -757,12 +751,7 @@ Phase 1（已完成）: DreamZero 先导实验 + 理论框架
   ✅ 四个架构代码分析 + 连续谱 + 四条挑战
   ✅ JEPA vs Attention 路由范式对比
 
-Phase 2a（3-4 周）: π₀ 先导实验（P0/P1/P2）
-  P0 ★★★: 梯度传播——决定目标 4（RL 闭环）可行性
-  P1 ★:   Prefix 扰动——验证目标 3（多频率）通用性
-  P2 ★★:  Random 替换——验证目标 1（分离必要性）
-  
-Phase 2b（重要，3-4 周）: FastWAM 先导实验——多频率验证
+Phase 2a（重要，3-4 周）: FastWAM 先导实验——多频率 + 梯度耦合
   F1 ★★★: 分离 vs 联合推理精度对比
   F2 ★★★: K/V 缓存持久性（频率鲁棒性）
   F3 ★★:  K/V 刷新策略消融
@@ -775,15 +764,15 @@ Phase 2d（重要，6-8 周）: COSMOS 3 先导实验
   P3b ★★★: Reasoner 作为 Reward 模型的准确率验证
   P3c ★★:  GRPO vs FM SFT 对比——平行确认 DreamZero 实验 E
   P3d ★:   全共享有害干扰——系统性确认
-  → 与 π₀ P0 并行，不相互依赖
+  → 与 FastWAM F5 并行，不相互依赖
 
 Phase 3（6-8 周）: 三 Expert 分离架构原型 + 目标 1/2/3 验证
   → 路线 A（推荐）：从 π₀ 出发 + Video Expert
   → 验证架构可行 → 全模态能力 → 多频率优势
 
-Phase 4（取决于 P0）: 
-  → P0 成立: COSMOS 3 GRPO → 目标 4 验证
-  → P0 不成立: 以目标 1-3 撰写论文
+Phase 4（取决于 FastWAM F5）: 
+  → F5 成立: 强耦合泛化 → COSMOS 3 GRPO → 目标 4 验证
+  → F5 不成立: 强耦合仅限于全共享 → 以目标 1-3 撰写论文
 ```
 
 ---
