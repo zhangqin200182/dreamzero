@@ -552,16 +552,48 @@ FastWAM 位于谱的右端（Video + Action Expert 分离，纯 DiT）。作为 
 
 **注：此阶段可选。如果 π₀ 上 P0 直接成立，可以跳过 FastWAM 验证直接进入 Phase 3。**
 
-#### 6.1.4 COSMOS 3 上的先导实验（Phase 2c，可选，2-3 周）
+#### 6.1.4 COSMOS 3 上的先导实验（Phase 2d，重要，6-8 周）
 
-COSMOS 3 位于谱的最左端（全共享双模），与 DreamZero 同侧但架构更复杂（AR + DiT）。验证全共享架构的有害干扰是否跨实现一致。
+COSMOS 3 是**目前唯一具备完整闭环基础设施的平台**：Policy（生成 action + video）+ Forward Dynamics（autoregressive rollout）+ Reasoner（VLM 语义判断）。它是唯一可以端到端验证"想象 RL"技术的平台。
 
-| 实验 | 验证假设 | 重要性 |
-|------|---------|--------|
-| P3': 全共享有害干扰 | COSMOS 3 是否存在 DreamZero 同款有害干扰？ | 如果存在 → 全共享的有害干扰是系统性问题，Expert 分离的必要性更强 |
-| P3'': 模式耦合 | COSMOS 3 AR 输出质量是否受 DiT denoising 干扰？ | 双模式全共享的特殊问题 |
+同时它位于谱的最左端（全共享双模），与 DreamZero 同侧——在它上面验证的 RL 结果可以**平行确认 DreamZero 实验 E（纯视频优化 -43.7%），且使用的是完整的 GRPO 闭环而非简单的 FM loss**。
 
-**注：此阶段同样可选。如果 P2 在 π₀ 上已经证明了 Expert 分离无有害干扰，COSMOS 3 的实验主要用于加强"全共享有系统性问题"的论证。**
+##### 实验设计
+
+| 实验 | 方法 | 验证问题 | 重要性 |
+|------|------|---------|--------|
+| **P3a: GRPO 工程可行性 ★★★** | 在 COSMOS 3 DROID Policy 上实现最小 GRPO 训练循环：N=4 采样，Reasoner-based reward，GRPO loss → LoRA 更新。在 100 个 episode 上跑 200 步 | GRPO 在视频扩散模型上能否稳定训练？ | **最高**——这是 GRPO 在视频生成+动作预测联合模型上的首次尝试 |
+| **P3b: Reasoner 作为 Reward 模型 ★★★** | 对 100 个 DROID rollout 视频，用 COSMOS 3 Reasoner 判断"任务是否完成"，与 GT action 的 success label 对比 | Reasoner 做机器人任务成功检测的准确率？ | **关键**——如果准确率 < 70%，需要探索替代 reward 方案 |
+| **P3c: GRPO vs FM 对比 ★★** | 200 步 GRPO vs 200 步 FM SFT → Action MSE | 在 COSMOS 3 全共享架构中，GRPO 能否超越 SFT？ | 平行确认 DreamZero 实验 E，用的是完整 GRPO 而非简单 FM loss |
+| **P3d: 全共享有害干扰 ★** | 在 COSMOS 3 Policy 模式中做 DreamZero 实验 B：random latent 替换 video → 测 Action MSE | COSMOS 3 是否存在 DreamZero 同款有害干扰？ | 如果存在 → 全共享有害干扰是系统性架构问题 |
+
+##### 这个先导的价值
+
+| P3a/P3b/P3c 能验证的 | P3a/P3b/P3c 不能验证的 |
+|---------------------|---------------------|
+| GRPO 在 WAM 上的工程可行性（训练稳定性、gradient 流动） | 强耦合在 Expert 分离架构中是否成立（P0 的核心问题——COSMOS 3 是全共享） |
+| Reasoner 能否做机器人任务成功检测（reward 函数质量） | GRPO 在三 Expert 分离架构中是否能收敛（中间梯度路径不同） |
+| COSMOS 3 全共享架构中 GRPO 能否改善 action（平行确认实验 E） | — |
+| 全共享的有害干扰是 DreamZero 特有还是系统性问题 | — |
+
+**即使 P3a/P3b/P3c 成功，P0 仍然是独立的需要验证的假设。** COSMOS 3 的结果可以证明"想象 RL 的工程可行 + Reasoner reward 有效 + 全共享中已验证"，但 Expert 分离架构中的梯度路径仍然需要 π₀ P0 实验来确认。
+
+##### 务实计划
+
+COSMOS 3 GRPO 和 π₀ P0 可以**并行推进**——不互相依赖。两者的结果在 Phase 4 汇合：
+
+```
+Phase 2d（COSMOS 3）: GRPO pipeline + Reasoner validation + harmful interference
+Phase 2a（π₀）:      P0 gradient propagation + P1 perturbation + P2 harmful interference
+
+↓ 两者并行，无依赖 ↓
+
+Phase 4: 
+  → 如果 π₀ P0 成立 + COSMOS GRPO pipeline 可行
+    → 三 Expert 架构 + GRPO → 完整的想象 RL 验证
+  → 如果 π₀ P0 不成立但 COSMOS GRPO pipeline 可行
+    → 想象 RL 仅在共享架构中有效（全共享 vs Expert 分离的定位调整）
+```
 
 ---
 
@@ -707,8 +739,12 @@ Phase 2a（3-4 周）: π₀ 先导实验（P0/P1/P2）
 Phase 2b（可选，2-3 周）: FastWAM 对照实验（P0'/P2'）
   → 如果 π₀ P0 直接成立可跳过
   
-Phase 2c（可选，2-3 周）: COSMOS 3 对照实验（全共享有害干扰）
-  → 加强"全共享有系统性问题"论证
+Phase 2d（重要，6-8 周）: COSMOS 3 先导实验
+  P3a ★★★: GRPO 工程可行性——GRPO 在 WAM 上的首次尝试
+  P3b ★★★: Reasoner 作为 Reward 模型的准确率验证
+  P3c ★★:  GRPO vs FM SFT 对比——平行确认 DreamZero 实验 E
+  P3d ★:   全共享有害干扰——系统性确认
+  → 与 π₀ P0 并行，不相互依赖
 
 Phase 3（6-8 周）: 三 Expert 分离架构原型 + 目标 1/2/3 验证
   → 路线 A（推荐）：从 π₀ 出发 + Video Expert
