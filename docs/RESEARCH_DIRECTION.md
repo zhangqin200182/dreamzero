@@ -27,9 +27,11 @@ COSMOS 3 的 AR Reasoner 和 DiT Generator 使用**同一组 Transformer blocks�
 
 4. **Action CoT → 推理与生成的桥梁**。Reasoner 的 Action CoT 任务——"给出 pick up the flower 的 2D 轨迹"→ 模型输出 `<think> I will move gripper to [713,680]...</think>` 后跟轨迹坐标——和 Generator Policy 的视觉→动作预测在本质上是同一件事。共享权重意味着语言化的动作推理可以直接加速连续动作空间的生成。
 
+**迁移是双向的**：DiT 训练同样帮助 AR 推理。Generator 训练期间，模型在 latent space 中学会了视频帧之间的连续动态——物体如何运动、场景如何变化。这种"动态直觉"编码在共享权重中，可以增强 Reasoner 的时序事件理解、下一动作预测和物理合理性判断。AR→DiT 和 DiT→AR 的正向循环是全共享架构设计的一个完整论证。
+
 **配方证据**：Policy-DROID 训练不是从零开始的 Generator-only 模型，而是从完整的 Cosmos3-Nano omni-checkpoint 启动。如果 AR 能力对 Policy 没用，NVIDIA 完全可以从 Generator 子集启动。
 
-**一句话**：COSMOS 3 的核心赌注——同一组参数在"理解世界"和"生成世界"之间产生正迁移——已被验证。这是全共享架构存在的根本原因。
+**一句话**：COSMOS 3 的核心赌注——同一组参数在"理解世界"和"生成世界"之间产生**双向正迁移**——已被验证。AR 训练给了 Generator 语义理解、物理常识、视觉表征；DiT 训练给了 Reasoner 动态直觉。**对 Action 生成来说，AR 带来的语言理解和物理推理能力直接降低了 Policy 学习所需的样本量和训练时间。** 这是全共享架构存在的根本原因，也是我们目标架构必须继承的能力。
 
 ### 1.2 FastWAM 的 Expert 分离：推理分开的价值
 
@@ -218,7 +220,62 @@ Layer i:
 
 ---
 
-## 五、先导实验：在现有平台上验证关键假设
+## 五、目标架构的优势：解决什么问题
+
+### 5.1 继承 COSMOS 3 的训练迁移，避免其代价
+
+COSMOS 3 的全共享架构证明了训练知识迁移的价值（第二节），但付出了四条代价：
+
+| COSMOS 3 的优势（我们继承） | COSMOS 3 的代价（我们解决） |
+|---|---|
+| AR→Action 语义迁移（共享参数） | **推理性能受限**：所有模态必须一起 forward（无法分离） |
+| 物理常识约束 Action 生成 | **有害干扰**：共享权重服务多种噪声分布 → 表示冲突（DreamZero 实验 B 在 COSMOS 3 中同样存在） |
+| 视觉理解迁移到 State Representation | **频率无法分离**：LLM/Video/Action 绑在一起执行（不能各自按需运行） |
+| Action CoT 加速连续动作生成 | **模态扩展代价高**：新模态需重新适应共享权重 |
+
+**我们的方案**：用**共享 Attention**（而非共享参数）实现训练迁移。AR LLM 和 Video/Action Expert 在 Joint Attention 中联合训练——语义知识通过 Q·K^T 路由传递到 Action，无需共享 Q/K/V/FFN 权重。推理时各 Expert 通过 KV cache 独立执行。
+
+**关键区别**：共享 Attention 保留了 COSMOS 3 的"LLM 和 Action 在同一个交互空间中"的优势（训练迁移的必要条件），但不需要它们共享参数（推理分离的必要条件）。这是全共享架构做不到的——全共享一旦分开了参数，训练迁移就断了。
+
+### 5.2 超越 FastWAM：从双 Expert 到三 Expert
+
+FastWAM 的 Video + Action 双 Expert 架构解决了推理性能和有害干扰问题（第四节），但有一个关键缺失：**没有语义层**。
+
+| FastWAM 的优势（我们继承） | FastWAM 的局限（我们补充） |
+|---|---|
+| Expert 分离 → 推理弱耦合（已验证） | **无语义推理**：文本仅通过 T5 cross-attention 注入——T5 只能做"相似性编码"，无法做任务规划、条件推理、空间理解 |
+| Video KV cache → 多频率执行 | **无世界模型闭环**：有 FD rollout 但缺语义 reward——无法区分"看起来像 wiping"和"真的在 wiping the right spot" |
+| DiT-DiT 分离 → 无害干扰（预期） | **无 AR LLM 的 CoT 能力**：不能将语言指令拆解为子任务序列 |
+
+**我们的方案**：加 AR LLM Expert——不仅是为了多频率的语义层，更是为了目标 4（RL 闭环）的语义 reward。没有 AR LLM 的世界模型闭环是"盲的"——只能靠视频重建质量判断好坏，不知道任务是否真的完成了。
+
+### 5.3 超越 π₀：从 VLA 到 WAM
+
+π₀ 的 LLM + Action 双 Expert 架构有语义理解和推理，但缺世界模型：
+
+| π₀ 的优势（我们参考） | π₀ 的局限（我们补充） |
+|---|---|
+| Block-causal mask → AR + DiT 和谐共存 | **无视频生成**：不能做 rollout 想象 → 无法做 RL 闭环 → 只能做 behavior cloning |
+| Prefix KV cache → LLM 1 次 + Action 10 步 | **无 Forward Dynamics**：不知道 action 执行后的未来状态 |
+| 已验证的 LLM→Action 训练耦合 | **无法做 Inverse Dynamics**：不能从视频反推动作 |
+
+**我们的方案**：加 Video Expert——让 π₀ 从 VLA（只能模仿）变成 WAM（可以想象）。Video Expert 的 Forward Dynamics 提供世界模型能力，使 RL 闭环成为可能。
+
+### 5.4 三 Expert 架构的独特价值总结
+
+| 问题 | 现有方案 | 三 Expert 方案 |
+|------|---------|---------------|
+| 训练时 LLM 知识如何到 Action？ | COSMOS 3：共享参数（但带来代价） | **共享 Attention——保留迁移，避免代价** |
+| 推理时如何避免全共享代价？ | FastWAM/π₀：Expert 分离（但缺语义/缺世界模型） | **三 Expert KV cache 分离——同时有语义 + 世界模型** |
+| 如何实现想象 RL？ | 无人做到 | **LLM reward + Video rollout + Action GRPO——完整闭环** |
+| 如何防止模态间有害干扰？ | 全共享架构中存在（实验 B） | **Expert 独立噪声调度——消除共享权重的冲突** |
+| 如何实现多频率执行？ | FastWAM：2 层 | **3 层——语义(~1Hz)→视觉(~10Hz)→动作(~50Hz)** |
+
+**一句话总结**：三 Expert 架构 = COSMOS 3 的训练迁移 + FastWAM 的推理效率 + π₀ 的语义理解 + 前两者都没有的世界模型 RL 闭环能力。它不是三个架构的简单拼接——共享 Attention 作为统一的跨模态路由机制，是这一切得以同时成立的前提。
+
+---
+
+## 六、先导实验：在现有平台上验证关键假设
 
 ### 5.1 FastWAM（多频率 + P0 + 语义验证）
 
@@ -258,7 +315,7 @@ FastWAM F5 和 COSMOS 3 GRPO 可以并行推进。
 
 ---
 
-## 六、研究路线图
+## 七、研究路线图
 
 ```
 Phase 1（已完成）✅
@@ -283,6 +340,6 @@ Phase 4（取决于 F5 + P3a）:
 
 ---
 
-## 七、总结
+## 八、总结
 
 > COSMOS 3 证明了训练应该在一起（共享参数 = 语义/物理/视觉知识迁移到 Action）。FastWAM 证明了推理应该分开（Expert 分离 = 多频率 + 无有害干扰 + 4× 加速）。DreamZero 实验揭示了推理弱耦合和训练强耦合是 Attention 路由的通用属性。三者共同指向目标架构：训练时共享 Attention 实现知识迁移，推理时 KV cache 分离实现多频率执行。FastWAM F5 决定这个架构的最终天花板。
