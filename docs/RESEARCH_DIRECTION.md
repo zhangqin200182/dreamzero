@@ -620,7 +620,9 @@ prefill_video_cache:           forward_action_with_video_cache:
 | **F5 ★★★** | **梯度传播** | 仅 backward video loss，测 Action 变化（平行 DreamZero 实验 D） | **DiT-DiT Expert 分离中强耦合是否成立？** ← 这是真正的 P0 | **决定目标 4（RL 闭环）的可行性** |
 | **F6 ★★** | Random 替换 | 替换 video latent → 测 Action 变化（平行 DreamZero 实验 B） | DiT-DiT Expert 分离中有害干扰？ | 目标 1 |
 | **F7 ★★★** | **三层多频率精度** | FastWAM + 轻量 AR LLM（冻结 Gemma 2B），block-causal：LLM 1 次 → Video 1 次 → Action 30 步 | 三 Expert 分离推理 vs Full joint 的精度对比？ | 目标 3 |
-| **F8 ★★** | **语义 vs 文本消融** | AR LLM 语义条件 vs T5 文本编码条件 → Action 精度差 | AR LLM 语义理解相比 T5 的增量收益？ | 目标 3 |
+| **F8 ★★** | **语义 vs 文本消融** | 相同任务，AR LLM 语义条件 vs T5 文本编码条件 → Action 精度差 | AR LLM 语义理解相比 T5 的增量收益？ | 目标 3 |
+| **F9 ★★★** | **LLM K/V vs T5 向量消融** | 对比"AR LLM 完整 18 层 K/V 注入"vs"仅 LLM 最后一层 CLS token"vs"T5 文本向量"→ Action 精度 | 共享 Attention 带来的 rich K/V 是否优于单一文本向量？ | **决定 AR LLM 是否需要共享 Attention** |
+| **F10 ★★** | **共享 Attention vs 外部 VLM reward** | 对比"LLM 通过 Joint Attention 看 video latent"vs"外部 VLM 看渲染视频"→ reward 打分准确率 | LLM 直接访问 Video Expert latent 是否比看渲染视频更准？ | **决定 AR LLM 是否需要内置（vs 外部 API）** |
 
 **F1-F4 是多频率计算层面的核心验证，F7-F8（新增）是多频率语义层面的验证，F5 是 P0，F6 验证有害干扰假说。**
 
@@ -641,6 +643,10 @@ prefill_video_cache:           forward_action_with_video_cache:
 | KV cache 分离 | ✗ | ✓（LLM K/V） | ✓（Video K/V）→ **加 LLM K/V** | ✗ |
 | Block-causal 可行性 | ✗ | ✓（18 层已验证） | ✓（30 层，同机制） | ✗ |
 | 多频率完整验证 | ✗ | 部分（无 Video 层） | **完整（可测三层语义→视觉→动作）** | ✗ |
+
+**F9/F10 是三 Expert 架构的"存在性论证"**：
+
+三 Expert 架构有两个核心主张：(1) AR LLM 通过共享 Attention 提供比 T5 向量更丰富的语义条件（F9），(2) LLM 共享 Attention 比外部 VLM 更适合做视频 reward 判断（F10）。如果两个都不成立——T5 足够，外部 VLM 也足够——那三 Expert 架构中内置 AR LLM 的理由不存在。两 Expert（FastWAM 现有架构）+ 外部 LLM API 就够了。
 
 **FastWAM 加 AR LLM 是验证目标 3（多层多频率语义理解）的最短路径——不需要等新架构搭建。** AR LLM 只需要一个冻结的 Gemma 2B + block-causal mask（从 π₀ 参考）。这不是生产级的语义层，但足够验证"多层多频率 + 语义理解"的核心主张。
 
