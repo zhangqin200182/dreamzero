@@ -109,9 +109,25 @@ AR 和 DiT         仅 token 类型区分  2 Expert MoT       2 Expert LLM
 
 **COSMOS 3 是最左端——全共享。** AR Reasoner 和 DiT Generator 使用**同一组 Transformer blocks、同一组 Q/K/V/FFN 权重**。区别仅在 attention mask（causal vs full）。这与 DreamZero 的本质相同——都是共享参数——只是共享的粒度不同：COSMOS 3 是不同 mode 共享同一组 blocks，DreamZero 是 video 和 action token 共享同一组 blocks。
 
-### 2.3 全共享架构面临的挑战
+### 2.3 全共享架构为什么存在——COSMOS 3 的设计动机与核心优势
 
-全共享架构（COSMOS 3、DreamZero）虽然参数效率高、训练耦合强，但存在四个系统性问题：
+共享参数的架构选择不是偶然的。COSMOS 3 的全共享设计服务于一个明确目标：**AR Reasoner 训练中获得的全部能力，通过共享权重直接迁移到 DiT Generator 的 Action 生成中。** 以下是四个层面的具体机制：
+
+**1. 语言理解 → 动作指令落地。** AR 模式训练了指令理解能力。Policy 推理时，文本指令经过**同一套 Q 投影矩阵**编码为 Key/Value。这些 representation 在 AR 训练中已经被"教"会了什么是杯子、什么是蓝色、什么是放置。DiT 去噪时的 cross-attention 可以直接利用这些语义信息约束动作生成。没有共享权重的话，Generator 的 cross-attention 需要从零学语言理解。
+
+**2. 物理推理 → 动作合理性约束。** Reasoner 明确训练了物理世界推理（Physical Plausibility Analysis, VideoPhy-2 SFT）："这个视频是物理上可能的吗？"模型学会了物体不穿墙、重力向下、因果关系、物体恒存性。共享的 FFN 层将同样的"物理常识"编码在权重中，DiT Policy 生成时自动避免不合理的 action。
+
+**3. 视觉理解 → 更好的状态表征。** Reasoner 模式训练了丰富的视觉理解（captioning、temporal localization、grounding）。Policy 的输入是同一张图像、经过同一个视觉塔、同一个 Transformer 编码。如果模型已在 AR 模式学会"这是一个机械臂，处于抓取姿态，目标物体在 (x, y)"，DiT 模式去噪 action tokens 时不需要从头学。
+
+**4. Action CoT → 推理与生成的桥梁。** Reasoner 的 Action CoT 任务是最直接的桥梁——"给出 pick up the flower 的 2D 轨迹"→ 模型输出 `<think> I will move gripper to [713,680]...</think>` 后跟轨迹坐标。Generator Policy 输入同一张图输出 joint action tokens。这两个任务本质上在做同一件事——从视觉输入预测动作——只是输出形式不同。**共享权重意味着语言化的动作推理可以直接加速连续动作空间的生成。**
+
+**配方证据**：Policy-DROID 训练不是从零开始的 Generator-only 模型，而是从完整的 Cosmos3-Nano omni-checkpoint 启动。如果 AR 能力对 Policy 没用，完全可以从 Generator 子集启动——但 NVIDIA 选择了完整检查点。
+
+**一句话总结 COSMOS 3 的核心设计动机**：同一组参数在"理解世界"（AR）和"生成世界"（DiT）之间产生正迁移。AR 训练给了 Generator 语义理解、物理常识、视觉表征；DiT 训练给了 Reasoner 动态直觉。这是全共享架构存在的根本原因，也是我们目标架构必须继承的核心能力。
+
+### 2.4 全共享架构的代价
+
+尽管训练迁移效果显著，全共享架构存在四个系统性问题：
 
 **1. 推理性能受限。** 所有模态的 token 必须一起通过所有 Transformer 层。即使只需要 Action 输出，Video token 也必须完成全部 forward 计算。DreamZero 的 AO 模式（跳过视频去噪）仍需要 Video token 在 16 步中去噪 16 次 Attention——这些计算没有产生任何有用的视频输出，但一个也不能省。
 
@@ -121,11 +137,11 @@ AR 和 DiT         仅 token 类型区分  2 Expert MoT       2 Expert LLM
 
 **4. 模态扩展代价高。** 加一个新模态意味着共享权重需要重新适应新的 token 分布和噪声调度。新的模态可能与已有模态的表示需求冲突，进一步加剧有害干扰。
 
-这四条挑战解释了为什么 FastWAM 和 π₀ 选择了 Expert 分离路线——它们本质上是对全共享架构的问题的回应。但代价是训练耦合的强度未知（P0）。
+这四条挑战解释了为什么 FastWAM 和 π₀ 选择了 Expert 分离路线——它们本质上是对全共享架构的问题的回应。**但它们没有解决 2.3 节的核心问题：Expert 分离架构能否保留全共享架构的训练知识迁移优势？** 这正是我们目标架构要回答的——用共享 Attention 替代共享参数，继承 COSMOS 3 的训练迁移（2.3），同时避免全共享的代价（2.4）。训练耦合在这种新架构中的强度由 FastWAM F5 验证。
 
-### 2.4 谱的架构含义
+### 2.5 谱的架构含义
 
-### 2.2 维度二：主干类型（VLM / DiT / 双模）
+### 2.6 维度二：主干类型（VLM / DiT / 双模）
 
 ```
                VLM 主干                     DiT 主干
