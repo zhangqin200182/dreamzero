@@ -150,7 +150,35 @@ action_loss AFTER:   2.33
 
 **统一结论**：Video loss 的梯度通过共享 Attention 权重传播到 action。纯视频优化无需任何 action 标注或梯度，即可将 action loss 减半。
 
-### 3.3 这两种属性在范式 A 中不成立
+### 3.3 关键 nuance：Expert 分离程度构成连续谱
+
+四个架构并非同质的"Expert 分离"，而是落在一条连续谱上（这一发现在 `RESEARCH_DIRECTION_REVIEW.md` 中被首次指出）：
+
+```
+全共享 ←────────────────────────────────────────────────→ 全分离
+
+DreamZero         FastWAM            π₀                COSMOS 3
+Q/K/V/FFN 全共享   Q/K/V/FFN 完全独立  Q/K/V/FFN 完全独立  独立 + 不同 attention mode
+仅 token 类型区分   但 head_dim 强制对齐  width 不同          (causal vs full)
+                  (3072=3072)       仅 head_dim=256 对齐   gen 有独立 MoE router
+```
+
+**这对实验结论的泛化有直接影响**：
+- DreamZero 是全共享架构，处于谱的最左端（耦合最紧）。我们的因果实验在此进行。
+- 将 DreamZero 的结论推广到整条谱时，"训练强耦合"的机制可能不同：在 DreamZero 中是**共享参数耦合**（Q/K/V/FFN 完全相同），在 Expert 分离架构中仅能通过 **Attention 的 Q·K^T 内积** 中的跨模态 score 间接传播梯度。
+- "推理弱耦合"则在 Expert 分离架构中**更强**（FastWAM/π₀/COSMOS 3 都主动跳过不需要的模态生成），而非更弱。
+
+### 3.4 实验 B 反直觉结果的重新解释
+
+Random/zero latent → action 改善 13%，可能不是因为"attention 多样性"（我们最初的理解），而是因为**共享 Q/K/V 权重同时服务两种 denoising 动态**产生了有害表示偏移：
+
+- Video 使用 `Beta(3,1)` 分布采样 sigma（偏向低噪声），Action 使用 `Uniform` 分布
+- 共享 Q/K/V 需要同时服务两种不同的噪声水平 → video token 在 attention 中产生的 K/V 对 action 的 denoising 路径形成干扰
+- 用 random latent 替换 video → 意外消除了这种干扰 → action 改善
+
+如果这个解释成立，意味着 Expert 分离不仅是优化选择，而是**防止模态间有害干扰的必要架构设计**。这是一个比"弱耦合推理加速"更强的 motivation。此假说需要在 Expert 分离架构（FastWAM 或 π₀）上验证：在 Expert 分离架构中做同样的 video latent 替换实验，预期**不会**看到 action 改善（因为不存在有害干扰需要消除）。
+
+### 3.5 这两种属性在范式 A 中不成立
 
 ```
                      范式 A (统一隐空间)              范式 B (Attention 对齐)
@@ -245,37 +273,69 @@ Layer i (共 N 层):
 
 ---
 
-## 六、研究路线图
+## 七、研究路线图（修正版）
+
+### 7.1 实验优先级
+
+> 基于 `RESEARCH_DIRECTION_REVIEW.md` 的代码级分析，重新排序实验优先级。
+
+| 优先级 | 实验 | 验证内容 | 当前状态 | 风险 |
+|--------|------|---------|---------|------|
+| **P0** | π₀ 梯度传播（平行 DreamZero 实验 D/E） | "训练强耦合"是否泛化到 Expert 分离架构 | **未做** | **高**：如果不成立，理论框架需要重大修正 |
+| **P1** | π₀ prefix 扰动（平行 DreamZero 实验 A/C） | "推理弱耦合"是否泛化到 LLM+Action 架构 | **未做** | 低：FastWAM/π₀ 已有主动弱耦合证据 |
+| **P2** | π₀/FastWAM random latent 替换（平行 DreamZero 实验 B） | Expert 分离架构中是否存在"有害干扰" | **未做** | 中：如果不存在有害干扰，是范式 B 的重要优势 |
+| **P3** | FastWAM 梯度传播 | 纯 DiT Expert 分离的中间验证点 | **未做** | 中 |
+
+### 7.2 分阶段计划
 
 ```
-Phase 1（已完成）: 先导验证
-  ✅ DreamZero 7 组因果实验（弱耦合 + 强耦合）
-  ✅ 四个架构深度分析（DreamZero / FastWAM / COSMOS 3 / π₀）
+Phase 1（已完成）: 先导验证 + 理论建立
+  ✅ DreamZero 7 组因果实验
+  ✅ 四个架构代码级分析
   ✅ JEPA 范式对比
-  ✅ 统一理论框架建立
+  ✅ 跨模态对齐范式文档
+  ✅ review 反馈整合
 
-Phase 2（4-6 周）: 弱耦合通用性验证 + 推理加速
-  - π₀ prefix 扰动实验（平行 DreamZero 实验 A/C）
-  - π₀/FastWAM 多频率分离推理实现
-  - 验证：弱耦合是 Attention 对齐的通用属性，与主干类型无关
+Phase 2（P0/P1/P2, 3-4 周）: 关键假设验证
+  - P0: π₀ 梯度传播实验——决定"训练强耦合"的泛化边界
+  - P1: π₀ prefix 扰动——确认"推理弱耦合"泛化
+  - P2: π₀ random latent 替换——验证"有害干扰"假说
+  - 根据结果决定论文最终定位
 
 Phase 3（6-8 周）: 三专家架构原型
   - 从 π₀ (LLM + Action) 出发，加 Video DiT Expert
-  - LoRA fine-tune，验证三专家推理分离
-  - 产出：三专家多频率推理 demo
+  - 简化方案（基于 review 建议）：Video Expert 仅做 prefix 编码（如 π₀ 的 SigLIP），
+    不参与 diffusion rollout。本质是 FastWAM 的 prefill_video_cache 策略
+  - 需注意 generation paradigm 冲突（AR LLM vs Diffusion Video）
+    参考 COSMOS 3 的 two_way_attention 解决方案
 
 Phase 4（8-12 周）: 想象 RL 训练
   - COSMOS 3 上实现 GRPO 训练管线
   - Reasoner-based reward + FD rollout
-  - 对比：SFT vs SFT+RL 的 action 精度
 
 Phase 5（综合）: 论文撰写
-  - 整合 Phase 2-4 的实验结果
-  - 定位：提出 Attention 层对齐作为独立范式，系统验证其属性
+  - 层次 1（已验证，可立即撰写）：Attention 对齐作为独立范式 + 推理弱耦合通用性
+  - 层次 2（待 P0 验证）：训练强耦合边界 + Expert 分离 vs 全共享优劣
 ```
+
+### 7.3 论文分层策略
+
+基于 review 建议，将论文定位分为两个可独立发表的层次：
+
+**层次 1（已可撰写）**：Attention 层对齐是一种独立的跨模态对齐范式
+- 四个架构的代码级收敛性证据
+- 推理弱耦合是其通用属性（π₀ prefix cache, FastWAM video cache, COSMOS 3 text cache 共同验证）
+- 多频率分离推理是自然推论
+- **贡献级别**：识别+系统化——将已有但未被连接的独立发现统一为范式
+
+**层次 2（待 P0 验证）**：范式 B 的训练耦合属性与 Expert 分离的优势
+- P0 决定"训练强耦合"是否泛化
+- P2 决定"有害干扰"假说是否成立（Expert 分离的必要性）
+- 三专家架构的统一
+- **贡献级别**：机制分析+架构创新——发现新属性并提出新架构
 
 ---
 
-## 七、总结
+## 八、总结
 
 > 跨模态对齐有两种范式：JEPA 的统一隐空间（Encoder 压缩对齐），和 VLA→WAM 的 Attention 层对齐（Expert 独立编码 + Q·K^T 无参数路由）。后者已被四个独立架构不约而同地实现，但从未被识别为一种独立的对齐范式。我们通过因果实验揭示了其关键属性——推理弱耦合（可分离执行）和训练强耦合（梯度互通）——并论证了它作为未来多模态架构方向的优势。
