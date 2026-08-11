@@ -511,54 +511,159 @@ Layer i:
 
 ## 六、研究路线图
 
-### 6.1 实验优先级
+### 6.1 第一步：先导实验——在三个平台上验证关键假设
 
-| 优先级 | 实验 | 平台 | 对应目标 | 验证问题 |
-|--------|------|------|---------|---------|
-| **P0** | 梯度传播 | π₀ | 目标 4（RL 闭环） | 训练强耦合是否泛化到 Expert 分离架构？ |
-| **P1** | Prefix 扰动 | π₀ | 目标 3（多频率） | 弱耦合是否泛化到 VLA 架构？（预期成立） |
-| **P2** | Random latent 替换 | π₀ | 目标 1（分离优势） | Expert 分离中是否存在有害干扰？ |
-| **P3** | 三 Expert 原型 | π₀ + Video | 目标 1+2（架构+能力） | 分离架构能否实现全模态功能？ |
+在进入架构设计和完整目标之前，需要在三个代表性平台上完成关键假设验证。每个平台验证不同的谱位置和不同的假设。
 
-### 6.2 分阶段计划
+#### 6.1.1 DreamZero 上的先导实验（Phase 1，已完成 ✅）
+
+DreamZero 位于谱的最左端（全共享 DiT），提供了最严格耦合条件下的基线数据。
+
+| 实验 | 验证假设 | 结论 |
+|------|---------|------|
+| A: flow_pred 噪声注入 | 推理弱耦合（全共享架构） | ✅ 成立：σ=0~1.0，Action ±0.1 MSE |
+| B: video latent 替换 | 有害干扰（全共享架构） | ✅ 发现：random latent → Action +13% |
+| C: 第一帧语义扰动 | CLIP 贡献粒度 | ✅ 成立：语义无关，仅需"像真实照片" |
+| D: 单步梯度传播 | 训练强耦合（全共享，单步） | ✅ 成立：Action -58.8% |
+| E: 100 步持续优化 | 训练强耦合（全共享，多步） | ✅ 成立：Action -43.7%，含联合训练对照 |
+
+**产出**：全共享架构的完整属性画像 + 有害干扰假说 + 实验方法论（可复用到 π₀/FastWAM）。
+
+#### 6.1.2 π₀ 上的先导实验（Phase 2a，3-4 周）
+
+π₀ 位于谱的右端（LLM + Action Expert 分离），验证 Expert 分离架构的耦合属性。**优先级最高——P0 的结果决定整个项目的天花板。**
+
+| 实验 | π₀ 平行 | 验证假设 | 重要性 |
+|------|---------|---------|--------|
+| **P0: 梯度传播** | 平行 D/E | 训练强耦合是否泛化到 Expert 分离？仅 backward LLM loss 或 video loss，测 Action 变化 | **决定目标 4（RL 闭环）的可行性** |
+| **P1: Prefix 扰动** | 平行 A/C | 弱耦合在 VLA 架构中是否成立？扰动 LLM prefix，测 Action 精度 | 支持目标 3（多频率） |
+| **P2: Random 替换** | 平行 B | Expert 分离中是否存在有害干扰？替换 Action Expert 的 latent，测 Action 精度 | 支持目标 1（分离必要性） |
+
+**预期结果**：P1 预期成立（π₀ 已有 prefix KV cache 的主动弱耦合证据）。P2 预期无害干扰（Expert 分离避免了共享权重的冲突）。**P0 完全未知——这是唯一的高风险实验。**
+
+#### 6.1.3 FastWAM 上的先导实验（Phase 2b，可选，2-3 周）
+
+FastWAM 位于谱的右端（Video + Action Expert 分离，纯 DiT）。作为 π₀ 的对照——验证 DiT-DiT 分离（而非 LLM-DiT 分离）的耦合属性。如果 π₀ 上 P0 不成立，在 FastWAM 上测试可以提供"是否是 DiT-DiT 的特殊性"的中间答案。
+
+| 实验 | 验证假设 | 重要性 |
+|------|---------|--------|
+| P0': 梯度传播 | DiT-DiT Expert 分离中强耦合是否成立？ | π₀ P0 的对照——区分"LLM-DiT 分离" vs "DiT-DiT 分离" |
+| P2': Random 替换 | DiT-DiT Expert 分离中有害干扰？ | 验证有害干扰假说的跨架构一致性 |
+
+**注：此阶段可选。如果 π₀ 上 P0 直接成立，可以跳过 FastWAM 验证直接进入 Phase 3。**
+
+#### 6.1.4 COSMOS 3 上的先导实验（Phase 2c，可选，2-3 周）
+
+COSMOS 3 位于谱的最左端（全共享双模），与 DreamZero 同侧但架构更复杂（AR + DiT）。验证全共享架构的有害干扰是否跨实现一致。
+
+| 实验 | 验证假设 | 重要性 |
+|------|---------|--------|
+| P3': 全共享有害干扰 | COSMOS 3 是否存在 DreamZero 同款有害干扰？ | 如果存在 → 全共享的有害干扰是系统性问题，Expert 分离的必要性更强 |
+| P3'': 模式耦合 | COSMOS 3 AR 输出质量是否受 DiT denoising 干扰？ | 双模式全共享的特殊问题 |
+
+**注：此阶段同样可选。如果 P2 在 π₀ 上已经证明了 Expert 分离无有害干扰，COSMOS 3 的实验主要用于加强"全共享有系统性问题"的论证。**
+
+---
+
+### 6.2 第二步：构建三 Expert 分离架构原型（Phase 3，6-8 周）
+
+先导实验完成后，基于结果选择构建路线。
+
+**主路线（路线 A：从 π₀ 出发，推荐）**：
 
 ```
-Phase 1（已完成）: 先导实验 + 理论框架
-  ✅ DreamZero 7 组因果实验（推理弱耦合 + 训练强耦合 + 有害干扰）
-  ✅ 四个架构代码级分析 + Expert 分离连续谱
-  ✅ 全共享 vs Expert 分离的四条挑战
-  ✅ JEPA vs Attention 路由的范式对比
-  ✅ 三 Expert 分离双模架构方案
-
-Phase 2（P0/P1/P2, 3-4 周）: 关键假设验证
-  - P0: π₀ 梯度传播 → 决定目标 4（RL 闭环）的可行性
-        若成立 → GRPO 梯度路径通畅，三 Expert RL 闭环可行
-        若不成立 → 训练耦合仅存在于全共享架构，需调整目标 4 方案
-  - P1: π₀ prefix 扰动 → 支持目标 3（多频率），预期成立
-  - P2: π₀ random latent 替换 → 支持目标 1（分离优势）
-
-Phase 3（P3, 6-8 周）: 三 Expert 原型验证
-  - 目标 1: 构建 π₀ + Video Expert 分离架构（LoRA fine-tune）
-  - 目标 2: 验证全模态能力（Policy/FD/ID/Reasoner 四种模式）
-  - 目标 3: 验证多频率执行精度不退化
-
-Phase 4（取决于 P0 结果）: 想象 RL 原型 或 论文撰写
-  - 如果 P0 成立: COSMOS 3 上实现 GRPO → 验证目标 4（RL 闭环）
-  - 如果 P0 不成立: 以架构+多频率+Expert 分离优势撰写论文
+π₀ (LLM 2B + Action 300M, 18 layers, JAX/PyTorch)
+  → 加 Video Expert（Wan2.2-5B 或冻结主干）
+  → 三 Expert Joint Self-Attention（每层 cat Q/K/V, Flash Attention）
+  → LoRA fine-tune（仅训练新增的 Video Expert + Action Expert 的 LoRA）
+  → LLM Expert 冻结（PaliGemma 预训练权重保留）
 ```
 
-### 6.3 论文策略（与四目标对应）
+**关键工程决策**：
 
-**基础贡献（目标 1-3，风险低，已有多项证据）**：
-- 识别 Attention 路由为独立于共享隐空间的跨模态交互范式
-- 全共享 vs Expert 分离的四条挑战 + 有害干扰假说（实验 B，P2 验证）
-- 推理弱耦合的多维度验证（DreamZero 7 组实验 + FastWAM/π₀ 推理策略）
-- 三 Expert 分离架构 + 全模态能力验证（P3 原型）
+| 决策点 | 选项 | 推荐 |
+|--------|------|------|
+| Video Expert 来源 | Wan2.2-5B / 冻结轻量 DiT / 从零训练 | Wan2.2-5B 冻结主干 + LoRA |
+| Joint Attention 实现 | 拼接 Q/K/V（FastWAM 方式） | 拼接 Q/K/V——已有代码参考 |
+| 训练策略 | 全量 fine-tune / LoRA Expert / 冻结 LLM | LoRA Action + Video，冻结 LLM |
+| AR vs DiT 冲突 | 是否处理 LLM causal 和 DiT bidirectional 的 mask 冲突？ | 初期不做 Video diffusion rollout——Video Expert 只做 prefix 编码（prefill_video_cache），不生成未来视频 |
+
+**备选路线（路线 B：从 FastWAM 出发）**：
+
+```
+FastWAM (Video 5B + Action 1B, 30 layers)
+  → 加 LLM Expert（PaliGemma 2B 或冻结主干）
+  → 需额外处理 AR vs DiT 的 attention mask 冲突
+  → 可参考 COSMOS 3 的 two_way_attention 方案
+```
+
+路线 A 更务实——不需要解决 AR vs DiT 的 attention mask 冲突（初期 Video Expert 不做 diffusion rollout）。
+
+---
+
+### 6.3 第三步：逐目标验证（Phase 3 续）
+
+架构原型搭建完成后，按目标递进验证：
+
+**目标 1 验证（架构可行）**：三 Expert 推理分离可以运行，各 Expert 独立 forward + KV cache 复用。
+
+**目标 2 验证（全模态能力）**：在 Expert 分离架构中实现并验证四种模式：
+
+| 模式 | 验证内容 | 对标 |
+|------|---------|------|
+| Policy | 首帧 + 指令 → action 精度 vs COSMOS 3 | COSMOS 3 Policy 模式 |
+| Forward Dynamics | 首帧 + action → 视频质量 vs COSMOS 3 | COSMOS 3 FD 模式 |
+| Inverse Dynamics | 视频 → action 精度 vs COSMOS 3 | COSMOS 3 ID 模式 |
+| Reasoner | 图像 + 文本 → 推理质量 vs COSMOS 3 | COSMOS 3 Reasoner 模式 |
+
+**目标 3 验证（多频率优势）**：在 Policy 模式下对比 full joint inference vs 多频率分离 inference（精度 + 延迟）。
+
+**目标 4 验证（RL 闭环）**：前提——P0 成立 + COSMOS 3 基础设施完备。在 COSMOS 3 上实现 GRPO 管线，或在新架构上实现简化的想象训练。
+
+---
+
+### 6.4 分阶段总览
+
+```
+Phase 1（已完成）: DreamZero 先导实验 + 理论框架
+  ✅ 7 组因果实验（全共享架构属性画像）
+  ✅ 四个架构代码分析 + 连续谱 + 四条挑战
+  ✅ JEPA vs Attention 路由范式对比
+
+Phase 2a（3-4 周）: π₀ 先导实验（P0/P1/P2）
+  P0 ★★★: 梯度传播——决定目标 4（RL 闭环）可行性
+  P1 ★:   Prefix 扰动——验证目标 3（多频率）通用性
+  P2 ★★:  Random 替换——验证目标 1（分离必要性）
+  
+Phase 2b（可选，2-3 周）: FastWAM 对照实验（P0'/P2'）
+  → 如果 π₀ P0 直接成立可跳过
+  
+Phase 2c（可选，2-3 周）: COSMOS 3 对照实验（全共享有害干扰）
+  → 加强"全共享有系统性问题"论证
+
+Phase 3（6-8 周）: 三 Expert 分离架构原型 + 目标 1/2/3 验证
+  → 路线 A（推荐）：从 π₀ 出发 + Video Expert
+  → 验证架构可行 → 全模态能力 → 多频率优势
+
+Phase 4（取决于 P0）: 
+  → P0 成立: COSMOS 3 GRPO → 目标 4 验证
+  → P0 不成立: 以目标 1-3 撰写论文
+```
+
+---
+
+### 6.5 论文策略（与四目标对应）
+
+**基础贡献（目标 1-3，风险低）**：
+- Attention 路由范式识别（四个架构收敛性 + 连续谱）
+- 推理弱耦合的多平台验证（DreamZero + π₀ + FastWAM）
+- 有害干扰假说（实验 B + P2 对照）→ Expert 分离必要性
+- 三 Expert 分离架构 + 全模态能力 + 多频率优势（P3 原型）
 
 **增强贡献（目标 4，依赖 P0）**：
-- 训练强耦合在 Expert 分离架构中的泛化验证（P0）
-- GRPO 想象 RL 闭环的可行性证明
-- 如果 P0 + P3 都成立：完整的"Attention 路由范式 + 全模态多频率架构 + 想象 RL"三项论证
+- 训练强耦合的泛化边界（P0）
+- GRPO 想象 RL 闭环（首次实现无需真机的视觉想象训练）
+- 完整论证：Attention 路由范式 + 全模态多频率架构 + 想象 RL
 
 ---
 
