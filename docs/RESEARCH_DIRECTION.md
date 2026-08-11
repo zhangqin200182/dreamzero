@@ -619,19 +619,30 @@ prefill_video_cache:           forward_action_with_video_cache:
 | **F4 ★★** | **与 π₀ 对比** | 在相同 DROID 任务上，对比 FastWAM 分离推理 vs π₀ prefix cache 推理的 Action 精度 + 延迟 | DiT-DiT 分离 vs LLM-DiT 分离，多频率执行的效率对比 | 目标 3 |
 | **F5 ★★★** | **梯度传播** | 仅 backward video loss，测 Action 变化（平行 DreamZero 实验 D） | **DiT-DiT Expert 分离中强耦合是否成立？** ← 这是真正的 P0 | **决定目标 4（RL 闭环）的可行性** |
 | **F6 ★★** | Random 替换 | 替换 video latent → 测 Action 变化（平行 DreamZero 实验 B） | DiT-DiT Expert 分离中有害干扰？ | 目标 1 |
+| **F7 ★★★** | **三层多频率精度** | FastWAM + 轻量 AR LLM（冻结 Gemma 2B），block-causal：LLM 1 次 → Video 1 次 → Action 30 步 | 三 Expert 分离推理 vs Full joint 的精度对比？ | 目标 3 |
+| **F8 ★★** | **语义 vs 文本消融** | AR LLM 语义条件 vs T5 文本编码条件 → Action 精度差 | AR LLM 语义理解相比 T5 的增量收益？ | 目标 3 |
 
-**F1-F4 是多频率目标的核心验证，F5（梯度传播）是整个项目的 P0——决定目标 4（RL 闭环）的可行性，F6 验证有害干扰假说。** F1-F4 的结果不依赖 F5 结果——它们只依赖弱耦合（已确认成立）。
+**F1-F4 是多频率计算层面的核心验证，F7-F8（新增）是多频率语义层面的验证，F5 是 P0，F6 验证有害干扰假说。**
 
-**为什么 FastWAM 是多频率最好的验证平台**：
+**为什么 FastWAM 需要加 AR LLM 才能完整验证多频率**：当前 F1-F4 只验证了 Video↔Action 的计算多频率（跳过 Video 计算）。但 5.3 节的完整论证是：**LLM 层的语义理解是多频率的关键收益之一**——没有 AR LLM，多频率退化为"不同推理频率"而非"不同语义层次的执行"。需要加 AR LLM Expert 来验证完整的语义→视觉→动作三层多频率。
+
+**新增实验——语义多频率验证**：
+
+| 优先级 | 实验 | 方法 | 验证问题 | 对应目标 |
+|--------|------|------|---------|---------|
+| **F7 ★★★** | **三层多频率精度** | FastWAM + 轻量 AR LLM（冻结 Gemma 2B），三 Expert block-causal 推理：LLM 1 次 → 缓存 K_l → Video 1 次 → 缓存 K_v → Action 30 步 | 三 Expert 分离推理精度是否等于 Full joint？ | 目标 3 |
+| **F8 ★★** | **语义 vs 文本编码消融** | 相同任务，对比 AR LLM 语义条件 vs T5 文本编码条件的 Action 精度 | AR LLM 的语义理解是否优于 T5 文本嵌入？多了多少？ | 目标 3 |
+
+**为什么 FastWAM 是完整多频率验证的最佳平台**：
 
 | | DreamZero | π₀ | FastWAM | COSMOS 3 |
 |---|---|---|---|---|
-| Expert 分离 | ✗ | ✓ | ✓ | ✗ |
-| KV cache 分离 | ✗ | ✓（LLM K/V） | ✓（Video K/V） | ✗ |
-| 多频率可测试 | ✗ | 部分（2 Expert） | **完全（2 Expert, 标准接口）** | ✗ |
-| 代码参考 | — | `pi0.py:233-278` | `mot.py:prefill_video_cache` | — |
+| Expert 分离 | ✗ | ✓（2 Expert） | ✓（2 Expert）→ **加 LLM = 3 Expert** | ✗ |
+| KV cache 分离 | ✗ | ✓（LLM K/V） | ✓（Video K/V）→ **加 LLM K/V** | ✗ |
+| Block-causal 可行性 | ✗ | ✓（18 层已验证） | ✓（30 层，同机制） | ✗ |
+| 多频率完整验证 | ✗ | 部分（无 Video 层） | **完整（可测三层语义→视觉→动作）** | ✗ |
 
-**FastWAM 是验证目标 3（多频率优势）的理想平台——不需要等待新架构搭建，可以直接在现有代码上跑实验。**
+**FastWAM 加 AR LLM 是验证目标 3（多层多频率语义理解）的最短路径——不需要等新架构搭建。** AR LLM 只需要一个冻结的 Gemma 2B + block-causal mask（从 π₀ 参考）。这不是生产级的语义层，但足够验证"多层多频率 + 语义理解"的核心主张。
 
 #### 6.1.4 COSMOS 3 上的先导实验（Phase 2d，重要，6-8 周）
 
@@ -818,13 +829,12 @@ Phase 1（已完成）: DreamZero 先导实验 + 理论框架
   ✅ 四个架构代码分析 + 连续谱 + 四条挑战
   ✅ JEPA vs Attention 路由范式对比
 
-Phase 2a（重要，3-4 周）: FastWAM 先导实验——多频率 + 梯度耦合
-  F1 ★★★: 分离 vs 联合推理精度对比
-  F2 ★★★: K/V 缓存持久性（频率鲁棒性）
-  F3 ★★:  K/V 刷新策略消融
-  F4 ★★:  与 π₀ 多频率效率对比
-  F5-F6:   耦合属性辅助验证（梯度 + 有害干扰）
-  → 目标 3（多频率）的核心验证平台，不依赖 π₀ P0 结果
+Phase 2a（重要，4-6 周）: FastWAM 先导实验——多频率 + 梯度耦合
+  F1-F4: 计算多频率验证（精度/鲁棒性/刷新/对比）
+  F7-F8: 语义多频率验证（三层 block-causal + AR LLM vs T5 消融）
+  F5 ★★★: 梯度传播（P0——决定 RL 闭环可行性）
+  F6:    有害干扰验证
+  → 完整的二层（计算）+ 三层（语义）多频率验证
   
 Phase 2d（重要，6-8 周）: COSMOS 3 先导实验
   P3a ★★★: GRPO 工程可行性——GRPO 在 WAM 上的首次尝试
