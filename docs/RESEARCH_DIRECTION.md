@@ -352,71 +352,136 @@ FastWAM 的 Video + Action 双 Expert 架构解决了推理性能和有害干扰
 
 ---
 
-## 六、先导实验：在现有平台上验证关键假设
+---
 
-### 5.1 FastWAM（多频率 + P0 + 语义验证）
+## 六、研究路线图
 
-FastWAM 已有 Expert 分离 + video KV cache + action 独立去噪——不需新架构即可直接验证核心假设。
+### 6.1 平台分工
 
-| 实验 | 方法 | 验证问题 | 对应目标 |
+四种架构在路线图中各司其职：
+
+| 平台 | 谱位置 | 角色 | 关键实验 | 决定了 |
+|------|--------|------|---------|--------|
+| **DreamZero** | 最左（全共享） | 全共享属性基线 | 7 组因果实验（✅ 已完成） | 耦合机制发现 + 实验方法论 |
+| **FastWAM** | 偏右（DiT-DiT 分离） | **多频率 + P0 + 语义验证** | F1-F8 | 目标 3（多频率）+ 目标 4 可行性 |
+| **COSMOS 3** | 最左（全共享双模） | **想象 RL 先导** | P3a-c | RL 工程可行性 + Reward 质量 |
+| **π₀** | 最右（LLM-DiT 分离） | 架构参考 + Block-causal 方案 | —（不需先导实验） | 三 Expert 的语义层设计参考 |
+
+### 6.2 先导实验详细设计（Phase 2）
+
+#### 6.2.1 FastWAM 先导实验（4-6 周）
+
+FastWAM 已有 Expert 分离 + video KV cache + action 独立去噪——不需新架构即可直接验证。
+
+**计算多频率验证（F1-F4）**：
+
+| 实验 | 方法 | 验证问题 | 成功标准 |
 |------|------|---------|---------|
-| **F1 ★★★** | 分离推理 vs 联合推理 → Action MSE | 多频率精度是否等同于 Full joint？ | 目标 3 |
-| **F2 ★★★** | 固定 video K/V → 连续 50 步 Action → Action MSE 曲线 | K/V 缓存的保质期？ | 目标 3 |
-| **F3 ★★** | 每 5 步 vs 每 10 步 vs 从不刷新 video K/V | 最优刷新策略？ | 目标 3 |
-| **F5 ★★★** | **仅 backward video loss → 测 Action 变化**（平行 DreamZero 实验 D） | **DiT-DiT Expert 分离中强耦合是否成立？** | **目标 4（P0）** |
-| **F6 ★★** | video latent 替换 → 测 Action（平行 DreamZero 实验 B） | Expert 分离中是否存在有害干扰？ | 目标 1 |
-| **F7 ★★★** | FastWAM + 冻结 AR LLM → 三 Expert block-causal 推理 | 三层多频率是否可行？ | 目标 3 |
-| **F8 ★★★** | 共享 Attention 训练 vs LLM 冻结仅推理注入 vs T5 基线 | AR LLM 训练迁移的必要性？ | 目标 1+3 |
+| **F1 ★★★** | 分离推理 vs Full joint → Action MSE | 多频率精度是否等同于联合推理？ | Action MSE 差异 < 3% |
+| **F2 ★★★** | 固定 video K/V → 连续 50 步 Action → Action MSE 曲线 | K/V 缓存的有效期？ | 曲线不平滑上升（无累积退化） |
+| **F3 ★★** | 每 5 步 vs 每 10 步 vs 从不刷新 video K/V | 最优刷新策略？ | 输出最优刷新频率 |
+| **F4 ★★** | 相同 DROID 任务，FastWAM 分离 vs π₀ prefix cache | DiT-DiT vs LLM-DiT 多频率效率 | Action MSE + 延迟对比 |
 
-F5 是整个项目的 P0——决定训练强耦合能否泛化到 Expert 分离架构，决定目标 4（RL 闭环）的可行性。F8 验证 COSMOS 3 的训练迁移机制在 Expert 分离架构中是否可复现。
+**耦合属性验证（F5-F6）**：
 
-### 5.2 COSMOS 3（想象 RL 先导）
+| 实验 | 方法 | 验证问题 | 重要性 |
+|------|------|---------|--------|
+| **F5 ★★★** | 仅 backward video loss，更新 LoRA 一步 → Action 变化（平行 DreamZero 实验 D） | **DiT-DiT Expert 分离中强耦合是否成立？** | **P0——决定目标 4（RL 闭环）的可行性** |
+| **F6 ★★** | video latent 替换为 random/zero → Action 变化（平行 DreamZero 实验 B） | Expert 分离中是否存在有害干扰？ | 验证有害干扰假说 |
+
+**语义多频率验证（F7-F8）**：
+
+| 实验 | 方法 | 验证问题 | 重要性 |
+|------|------|---------|--------|
+| **F7 ★★★** | FastWAM + 冻结 AR LLM（Gemma 2B）→ 三 Expert block-causal 推理（LLM 1 次 → Video 1 次 → Action 30 步） | 三层多频率是否可行？精度 vs Full joint？ | 三 Expert 架构的最小可行验证 |
+| **F8 ★★★** | 共享 Attention 训练 vs LLM 冻结仅推理注入 vs T5 基线 → Action 精度 | AR LLM 的训练迁移是否优于独立训练 + 文本注入？ | 决定 AR LLM 是否需要参与训练（vs 仅推理注入） |
+
+#### 6.2.2 COSMOS 3 先导实验（6-8 周，可与 FastWAM 并行）
 
 COSMOS 3 是目前唯一具备完整闭环基础设施的平台（Policy + Forward Dynamics autoregressive rollout + Reasoner VLM）。
 
-| 实验 | 方法 | 验证问题 |
-|------|------|---------|
-| **P3a ★★★** | GRPO 最小循环：N=4，Reasoner reward，200 步，LoRA 更新 | GRPO 在 WAM 上的工程可行性？ |
-| **P3b ★★★** | 100 个 DROID rollout → Reasoner 判断 vs GT label | Reasoner 做任务成功检测的准确率？ |
-| **P3c ★★** | GRPO vs FM SFT → Action MSE | 全共享中 GRPO 能否超越 SFT？（平行确认实验 E） |
+| 实验 | 方法 | 验证问题 | 成功标准 |
+|------|------|---------|---------|
+| **P3a ★★★** | 在 COSMOS 3 DROID Policy 上实现最小 GRPO 循环：N=4 采样，Reasoner reward（"Did the robot successfully [task]?"），GRPO loss → LoRA 更新，100 episodes，200 步 | GRPO 在 WAM 上的工程可行性？训练稳定性？ | Loss 收敛，无 NaN/梯度爆炸 |
+| **P3b ★★★** | 100 个 DROID rollout 视频 → Reasoner 判断"任务完成" → 与 GT action 的 success label 对比 | Reasoner 做机器人任务成功检测的准确率？ | 准确率 > 70%（如低于，需探索替代 reward 方案） |
+| **P3c ★★** | 200 步 GRPO vs 200 步 FM SFT → Action MSE | 全共享中 GRPO 能否超越 SFT？ | GRPO Action MSE ≤ SFT（平行确认 DreamZero 实验 E） |
 
-### 5.3 平台分工与依赖
+#### 6.2.3 平台间依赖关系
 
-| 平台 | 角色 | 不依赖 | 决定了 |
-|------|------|--------|--------|
-| **DreamZero** | 全共享属性基线（已完成 ✅） | — | 耦合机制发现 |
-| **FastWAM** | 多频率 + P0 + 语义训练迁移 | COSMOS 3 | 目标 3 + 目标 4 可行性 |
-| **COSMOS 3** | 想象 RL 先导 | FastWAM F5 | RL 工程可行性 + Reward 质量 |
+```
+FastWAM F1-F4 ──→ 目标 3（多频率）验证 ──┐
+                                          ├──→ Phase 3 三 Expert 原型
+FastWAM F5 ──→ 目标 4（RL 闭环）可行性 ──┤
+                                          │
+COSMOS 3 P3a-c ──→ RL 工程可行性 ────────┘
 
-FastWAM F5 和 COSMOS 3 GRPO 可以并行推进。
+F1-F4 不依赖 F5（只依赖弱耦合，已确认成立）
+F5 和 P3a 可以并行推进（不互依赖）
+Phase 3 需要 F5 成立（否则 Expert 分离中的训练迁移无法保证）
+Phase 4 需要 F5 + P3a 均成立
+```
 
----
-
-## 七、研究路线图
+### 6.3 完整时间线
 
 ```
 Phase 1（已完成）✅
   DreamZero 7 组因果实验 → 推理弱耦合 + 训练强耦合 + 有害干扰假说
-  四个架构代码级分析 → 连续谱 + 全共享四条挑战
-  Attention 路由范式识别
+  四个架构代码级分析 → 连续谱 + 全共享代价
+  Attention 路由范式识别 → 理论框架建立
 
-Phase 2（4-6 周）: 先导实验
-  FastWAM: F1-F8（多频率 + P0 + 语义）
-  COSMOS 3: P3a-c（GRPO 先导）
-  → 并行推进，不互依赖
+Phase 2（4-8 周，并行推进）: 先导实验
+  FastWAM（4-6 周）:
+    Week 1-2: F1-F4（计算多频率）
+    Week 3-4: F5-F6（耦合属性）
+    Week 4-6: F7-F8（语义多频率，需先搭建 AR LLM 模块）
+  COSMOS 3（6-8 周）:
+    Week 1-3: P3a（GRPO 最小循环搭建）
+    Week 3-5: P3b（Reasoner reward 评测）
+    Week 5-8: P3c（GRPO vs SFT 对比）
 
-Phase 3（取决于 F5）:
-  F5 成立 → 三 Expert 原型搭建 + 目标 1-3 验证
-  F5 不成立 → 以 Phase 2 结果撰写论文
+Phase 3（取决于 F5，6-8 周）: 三 Expert 原型
+  若 F5 成立:
+    目标 1: FastWAM + 轻量 LLM → 三 Expert 架构搭建（LoRA fine-tune）
+    目标 2: 四种模式验证（Policy/FD/ID/Reasoner）
+    目标 3: 多频率执行精度 + 延迟评测
+  若 F5 不成立:
+    直接进入 Phase 4 论文撰写
 
-Phase 4（取决于 F5 + P3a）:
-  均成立 → 完整想象 RL 验证（目标 4）
-  仅 F5 成立 → 论文 = 机制分析 + 目标架构 + 先导实验
-  均不成立 → 论文 = 范式识别 + 属性发现 + Expert 分离优势
+Phase 4（取决于 F5 + P3a）: 想象 RL 原型 + 论文
+  若 F5 + P3a 均成立:
+    COSMOS 3 GRPO 完成 + 三 Expert 架构验证 → 完整目标 4 验证
+    论文 = 范式识别 + 机制分析 + 目标架构 + 想象 RL
+  若仅 F5 成立:
+    论文 = 范式识别 + 机制分析 + 目标架构 + 先导实验
+  若均不成立:
+    论文 = 范式识别 + 属性发现 + Expert 分离优势论证
 ```
+
+### 6.4 论文策略
+
+三档论文定位，按 F5 和 P3a 结果自动选择：
+
+**第一档（F5 + P3a 均成立）**：完整论证
+- Attention 路由范式识别 + 推理弱耦合 + 训练强耦合泛化
+- 三 Expert 分离架构：继承 COSMOS 3 迁移 + 实现 FastWAM 效率
+- 多频率执行验证（F1-F4, F7）
+- 想象 RL 闭环验证（P3a-c, Phase 4）
+- 贡献级别：范式识别 + 架构创新 + 训练方法创新
+
+**第二档（仅 F5 成立）**：架构论证
+- Attention 路由范式识别 + 耦合属性
+- 三 Expert 架构 + 多频率验证
+- 想象 RL 作为 future work
+- 贡献级别：范式识别 + 架构创新
+
+**第三档（均不成立）**：属性论证
+- Attention 路由范式识别
+- 推理弱耦合的多平台验证
+- Expert 分离优势（有害干扰假说）
+- 贡献级别：范式识别 + 属性发现
 
 ---
 
-## 八、总结
+## 七、总结
 
 > COSMOS 3 证明了训练应该在一起（共享参数 = 语义/物理/视觉知识迁移到 Action）。FastWAM 证明了推理应该分开（Expert 分离 = 多频率 + 无有害干扰 + 4× 加速）。DreamZero 实验揭示了推理弱耦合和训练强耦合是 Attention 路由的通用属性。三者共同指向目标架构：训练时共享 Attention 实现知识迁移，推理时 KV cache 分离实现多频率执行。FastWAM F5 决定这个架构的最终天花板。
