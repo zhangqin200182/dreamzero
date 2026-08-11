@@ -601,24 +601,93 @@ FastWAM (Video 5B + Action 1B, 30 layers)
 
 ---
 
-### 6.3 第三步：逐目标验证（Phase 3 续）
+### 6.3 第三步：逐目标验证（Phase 3 核心）
 
-架构原型搭建完成后，按目标递进验证：
+架构原型搭建完成后，每个目标需要独立的实验验证。目标的递进顺序定义了验证的先后依赖。
 
-**目标 1 验证（架构可行）**：三 Expert 推理分离可以运行，各 Expert 独立 forward + KV cache 复用。
+#### 6.3.1 目标 1 验证：架构可以跑，推理可分离
 
-**目标 2 验证（全模态能力）**：在 Expert 分离架构中实现并验证四种模式：
+**验证内容**：三 Expert 分离推理的工程可行性。
 
-| 模式 | 验证内容 | 对标 |
-|------|---------|------|
-| Policy | 首帧 + 指令 → action 精度 vs COSMOS 3 | COSMOS 3 Policy 模式 |
-| Forward Dynamics | 首帧 + action → 视频质量 vs COSMOS 3 | COSMOS 3 FD 模式 |
-| Inverse Dynamics | 视频 → action 精度 vs COSMOS 3 | COSMOS 3 ID 模式 |
-| Reasoner | 图像 + 文本 → 推理质量 vs COSMOS 3 | COSMOS 3 Reasoner 模式 |
+| 子实验 | 方法 | 成功标准 |
+|--------|------|---------|
+| **1a. 联合训练** | 三 Expert 通过 Joint Attention 完成一次完整的 forward + backward | loss 正常收敛，无 NaN/梯度爆炸 |
+| **1b. 推理分离** | LLM forward 1 次（→ K_l/V_l 缓存）→ Video forward 1 次（→ K_v/V_v 缓存）→ Action 10 步独立去噪（读缓存 K/V） | Action 输出完整，无 shape 不匹配 |
+| **1c. KV cache 正确性** | 对比分离推理 vs 联合推理的 Action 输出 | Action MSE 差异 < 1e-6（数值精度范围） |
 
-**目标 3 验证（多频率优势）**：在 Policy 模式下对比 full joint inference vs 多频率分离 inference（精度 + 延迟）。
+**依赖**：P3 原型搭建完成。
 
-**目标 4 验证（RL 闭环）**：前提——P0 成立 + COSMOS 3 基础设施完备。在 COSMOS 3 上实现 GRPO 管线，或在新架构上实现简化的想象训练。
+**失败处理**：如果 1b 失败（KV cache shape 不匹配），需要调整 expert 的 head_dim 对齐策略（参考 FastWAM：强制 `num_heads` 和 `head_dim` 对齐）。如果 1c 差异大，说明 KV cache 的实现有 bug。
+
+#### 6.3.2 目标 2 验证：全模态能力不丢失
+
+**验证内容**：三 Expert 分离架构能够覆盖 COSMOS 3 的全部功能。
+
+| 子实验 | 具体操作 | 评测指标 | 对标基线 | 成功标准 |
+|--------|---------|---------|---------|---------|
+| **2a. Policy** | 首帧 + 语言指令 + 状态 → 联合生成 video + action chunk | Action MSE（DROID 验证集）+ Video PSNR/SSIM | COSMOS 3 Policy 模式 | Action MSE 在 ±10% 以内 |
+| **2b. Forward Dynamics** | 首帧 + 真值 action → 逐帧生成未来视频 | Video PSNR/SSIM + FVD | COSMOS 3 FD 模式 | PSNR 在 ±2dB 以内 |
+| **2c. Inverse Dynamics** | 输入完整视频 → 预测 action 轨迹 | Action MSE | COSMOS 3 ID 模式 | Action MSE 在 ±10% 以内 |
+| **2d. Reasoner** | 图像 + 文本问题 → 文本回答 | LLM 输出质量（GPT-4 评分 / 任务准确率） | COSMOS 3 Reasoner 模式 | 输出质量无统计显著差异 |
+| **2e. 模式隔离** | 在 Policy 模式下，Video Expert 的 noise schedule 是否影响 Action Expert？ | 对比独立 noise schedule vs 共享 noise schedule 的 Action MSE | — | 独立 schedule 的 Action MSE ≤ 共享 schedule（即：无有害干扰） |
+
+**依赖**：目标 1 验证通过（架构可运行）。
+
+**关键风险**：2e（模式隔离）。如果分离架构仍然存在有害干扰，说明问题不在参数共享而在 Joint Attention 本身——这将要求理论框架修正。
+
+#### 6.3.3 目标 3 验证：多频率执行有实际收益
+
+**验证内容**：多频率分离推理的精度和性能优势。
+
+| 子实验 | 方法 | 评测指标 | 成功标准 |
+|--------|------|---------|---------|
+| **3a. 精度不退化** | Policy 任务：对比 Full joint inference（30 步 video + 30 步 action） vs 分离推理（LLM 1 次 + Video 1 次 + Action 30 步） | Action MSE | 分离推理 Action MSE ≤ Full joint（或差异 < 3%） |
+| **3b. 延迟降低** | 同一硬件上测量端到端延迟 | Wall-clock time（ms） | 延迟降低 ≥ 3×（参考 FastWAM 的 4× 加速） |
+| **3c. 频率鲁棒性** | 固定 LLM K/V 和 Video K/V，连续执行 100 步 Action → 评测 Action MSE 是否随步数退化 | Action MSE vs step 曲线 | 曲线不单调上升（无累积退化） |
+| **3d. 对比 π₀ baseline** | 在 DROID 验证集上对比三 Expert 分离推理 vs π₀（双 Expert） | Action MSE + 延迟 | Action MSE ≤ π₀，延迟 ≤ π₀（因 Expert 更多但可分离） |
+
+**依赖**：目标 2 验证通过（全模态能力确认）。
+
+**关键风险**：3c（频率鲁棒性）。如果视频上下文的微小变化（如新一帧）需要重新 Video forward，而新的 video K/V 与旧的 LLM K/V 在 Joint Attention 中产生不一致，可能导致精度退化。需要测试 K/V 缓存的有效期（多少 step 后需要刷新）。
+
+#### 6.3.4 目标 4 验证：想象 RL 闭环可行
+
+**验证内容**：通过 GRPO 在想象中训练，Action 精度确实改善。
+
+| 子实验 | 方法 | 评测指标 | 成功标准 |
+|--------|------|---------|---------|
+| **4a. 单步梯度验证** | 仅 backward video reward loss，测 Action 变化（平行 DreamZero 实验 D） | Action loss 变化率 | Action 有可测变化（> 5%） |
+| **4b. 多步 GRPO** | N=4 条去噪轨迹，CLIP/Reward model 打分，GRPO update，重复 200 步 | Action MSE 曲线 | 200 步后 Action 改善 > 20% |
+| **4c. 对比 SFT** | 同等计算量的 GRPO vs 联合 SFT → Action MSE | GRPO Action MSE ≤ SFT（或接近） | 证明 RL 不劣于 SFT（且不需要 GT action） |
+| **4d. 视频质量** | GRPO 训练前后生成的视频质量变化 | FVD / CLIP score | 视频质量不退化（证明 GRPO 的 reward model 有效） |
+
+**依赖**：P0 成立（训练强耦合泛化到 Expert 分离架构）+ COSMOS 3 或新架构上有可用 GRPO 管线。
+
+**关键风险**：
+
+| 风险 | 影响 | 缓解 |
+|------|------|------|
+| P0 不成立 | 梯度不通 → GRPO 无法影响 Action | 降级目标 4：仅验证目标 1-3，RL 闭环作为 future work |
+| Reward model 不准 | 视频质量无法区分好/坏 action | 先用 GT 视频做 pseudo-reward（MSE vs GT），验证 pipeline 后再换真实 reward |
+| GRPO 训练不稳定 | gradient variance 大，不收敛 | 降低 N（4→2），增大 batch，加 KL 正则化 |
+| Autoregressive rollout 误差累积 | 多步 rollout 视频质量退化严重 | 初期只做 1-2 步 rollout（简化的想象），验证核心机制 |
+
+#### 6.3.5 目标验证的依赖关系
+
+```
+目标 1（架构可运行）
+  └── 目标 2（全模态能力）── 2e（模式隔离）
+        │
+        ├── 目标 3（多频率优势）── 3a（精度） + 3b（延迟） + 3c（鲁棒性）
+        │
+        └── 目标 4（RL 闭环）← 额外依赖：P0 成立
+              ├── 4a（单步梯度）
+              ├── 4b（多步 GRPO）
+              └── 4c（对比 SFT）
+```
+
+- 目标 1-3 是工程验证 + 理论确认，风险低，可在 Phase 3 内完成
+- 目标 4 依赖 P0 实验结果，是唯一的外部依赖
 
 ---
 
