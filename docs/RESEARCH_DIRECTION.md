@@ -380,39 +380,131 @@ AO 模式的进一步证据：DreamZero 的 AO 本质是 16 步中 video 的 sig
 
 ---
 
-## 五、未来架构推测
+## 五、未来架构方向：综合判断
 
-基于已有证据，Attention 路由路线下的最优架构应具备：
+### 5.1 四条路径的收敛方向
 
-**1. Expert 分离而非全共享**：全共享架构的四条挑战——推理性能、有害干扰、频率分离、模态扩展——在 Expert 分离架构中全部可以得到缓解。FastWAM 和 π₀ 已经验证了推理性能（4× 加速）和频率分离（KV cache）。如果 P2 进一步验证了无害干扰，则 Expert 分离在四个维度上都优于全共享。**全共享架构的唯一潜在优势——训练强耦合——在 Expert 分离中的强度待 P0 验证。**
+基于实验证据和架构分析，四条路径收敛到同一个方向：
 
-**2. 双模统一 + Expert 分离的组合**：COSMOS 3 证明了双模统一可以在全共享架构中实现。但实现它的同时承受了全共享的四条代价。未来的问题是：能否在 Expert 分离架构中实现双模统一？即 AR Reasoner 和 DiT Generator 各自独立的 Expert，通过 Joint Attention 交互，同时避免全共享的代价。
+```
+COSMOS 3（全共享双模）    FastWAM（分离双专家）     π₀（分离双专家）
+       │                        │                      │
+       │ 问题：全共享代价         │ 缺：语义理解           │ 缺：世界模型
+       │                        │                      │
+       └────────────────────────┼──────────────────────┘
+                                ↓
+                    三 Expert 分离双模
+              （LLM + Video + Action, Expert 分离, Joint Attention）
+```
 
-**3. 多频率执行**：利用推理弱耦合，LLM ~1Hz、Video ~10Hz、Action ~50Hz。FastWAM 的 video KV cache 和 π₀ 的 prefix KV cache 已验证可行。
+**驱动因素**：
 
-**4. COSMOS 3 的核心价值**：它是目前唯一跨越"Expert 分离"和"主干类型"两个维度的架构，也是最接近"最优未来架构"的现有实现。理解它在连续谱上的确切位置至关重要。
+| 因素 | 来源 | 含义 |
+|------|------|------|
+| Expert 分离优于全共享（四条挑战） | 实验 B + FastWAM/π₀ 的 KV cache 推理 | 未来架构应走 Expert 分离路线 |
+| 语义 + 世界模型缺一不可 | 实验 E（纯视频可改善 action）+ π₀ 的语言优势 | LLM Expert + Video Expert 都需要 |
+| 双模统一可行 | COSMOS 3 证明了同一架构容纳 AR + DiT | 在 Expert 分离中复现是工程挑战而非理论障碍 |
+| 弱耦合支持多频率 | 实验 A/B/C + FastWAM/π₀ 推理策略 | Action 可以独立高频执行 |
+
+### 5.2 三 Expert 方案 vs 四种现有架构
+
+| | COSMOS 3 | FastWAM | π₀ | **三 Expert** |
+|---|---|---|---|---|
+| Expert 分离 | ✗（全共享） | ✓（2 Expert） | ✓（2 Expert） | **✓（3 Expert）** |
+| 语义理解 | ✓ | ✗ | ✓ | **✓** |
+| 世界模型（视频生成） | ✓ | ✓ | ✗ | **✓** |
+| 多频率执行 | ✗ | ✓ | ✓ | **✓** |
+| 有害干扰风险 | 有 | 预期无 | 预期无 | **预期无** |
+| RL 闭环 | 基础设施有，无 GRPO | 有 FD，缺语义 reward | 无世界模型 | **完整闭环** |
+| 预训练复用 | 自研 | Wan2.2 | PaliGemma | LLM + Video 预训练 |
+
+**三 Expert 方案是唯一同时覆盖所有维度的架构。**
+
+### 5.3 务实路径：从双 Expert 到三 Expert
+
+考虑到训练资源约束，采用渐进路线：
+
+```
+路线 A（从 π₀ 出发，推荐）：
+  π₀ (LLM 2B + Action 300M, 18层, 已开源, PyTorch port)
+    → 加 Video Expert（Wan2.2-5B 或冻结主干，LoRA fine-tune）
+    → 仅需训练 Action Expert + Video Expert 的 LoRA
+    → 验证三 Expert 推理分离后，再加 Video 生成能力
+
+路线 B（从 FastWAM 出发）：
+  FastWAM (Video 5B + Action 1B, 30层)
+    → 加 LLM Expert（PaliGemma 2B 或冻结主干，LoRA fine-tune）
+    → 需处理 generation paradigm 冲突（AR vs DiT attention mask）
+    → 可参考 COSMOS 3 的 two_way_attention
+```
+
+路线 A 更务实——π₀ 已有完整的训练/推理管线、PyTorch 实现、DROID fine-tune 配方。加 Video Expert 只需要加一个新的 Expert 模块（LoRA fine-tune），不需要解决 AR vs DiT 的 attention mask 冲突。
 
 ---
 
 ## 六、研究路线图
 
-| 优先级 | 实验 | 验证问题 | 决定什么 |
-|--------|------|---------|---------|
-| **P0** | π₀ 梯度传播 | 强耦合是否泛化到 Expert 分离架构？ | **论文 ceiling** |
-| **P1** | π₀ prefix 扰动 | 弱耦合是否泛化到 VLA 架构？ | 范式通用性 |
-| **P2** | FastWAM/π₀ random latent 替换 | Expert 分离中是否存在有害干扰？ | Expert 分离的必要性 |
-| **P3** | COSMOS 3 耦合分析 | 全共享双模架构中是否存在 DreamZero 同款有害干扰？ | COSMOS 3 全共享的代价 |
+### 6.1 实验优先级
+
+| 优先级 | 实验 | 平台 | 验证问题 | 决定什么 |
+|--------|------|------|---------|---------|
+| **P0** | 梯度传播 | π₀ | 训练强耦合是否泛化到 Expert 分离架构？ | **论文 ceiling + 三 Expert 的 RL 可行性** |
+| **P1** | Prefix 扰动 | π₀ | 弱耦合是否泛化到 VLA 架构？ | 范式通用性（低风险，预期成立） |
+| **P2** | Random latent 替换 | π₀ | Expert 分离中是否存在有害干扰？ | Expert 分离的必要性 |
+| **P3** | 双 Expert 联合训练 | π₀ + Video | 三 Expert 架构的最小可行验证 | Phase 3 的可行性 |
+
+### 6.2 分阶段计划
 
 ```
-Phase 1（已完成）: DreamZero 先导实验 + 理论框架
-Phase 2: P0/P1/P2 关键假设验证（决定论文定位）
-Phase 3: 架构原型或论文撰写（取决于 P0）
+Phase 1（已完成）: 先导实验 + 理论框架
+  ✅ DreamZero 7 组因果实验（推理弱耦合 + 训练强耦合 + 有害干扰）
+  ✅ 四个架构代码级分析 + Expert 分离连续谱
+  ✅ 全共享 vs Expert 分离的四条挑战
+  ✅ JEPA vs Attention 路由的范式对比
+  ✅ 三 Expert 分离双模架构方案
+
+Phase 2（P0/P1/P2, 3-4 周）: 关键假设验证
+  - P0: π₀ 上复现实验 D/E（video loss → action 梯度传播）
+        若成立 → 训练强耦合泛化，三 Expert RL 闭环可行
+        若不成立 → 训练耦合仅存在于全共享架构，调整论文定位
+  - P1: π₀ prefix 扰动实验（平行实验 A/C）
+        预期成立，低风险
+  - P2: π₀ random latent 替换（平行实验 B）
+        预期无有害干扰 → Expert 分离的优势证据
+
+Phase 3（P3, 6-8 周）: 三 Expert 原型
+  - π₀ + Video Expert（LoRA fine-tune）
+  - 验证三 Expert 推理分离（LLM K/V + Video K/V → Action 独立去噪）
+  - 验证多频率执行精度无损
+
+Phase 4: 论文撰写（取决于 Phase 2/3 结果）
+  - 如果 P0 成立：完整范式优越性论证 + 三 Expert 架构验证
+  - 如果 P0 不成立但 P2 成立：范式识别 + Expert 分离优势论证
+  - 如果都成立：最强版本——Attention 路由范式 + 三 Expert 架构
 ```
 
-**论文策略**：主贡献 = 识别 Attention 路由为独立范式（已可撰写）；延伸 = 训练强耦合的泛化边界 + 最优架构形态（P0 决定）。P0 不影响可发表性，只影响天花板。
+### 6.3 论文策略（分两档）
+
+**核心贡献（已可撰写，取决于 P0/P1/P2 结果）**：
+- 识别 Attention 层路由为独立于共享隐空间的跨模态交互范式（四个架构的收敛性证据）
+- 系统验证推理弱耦合属性（DreamZero 7 组实验 + FastWAM/π₀ 推理策略）
+- 全共享 vs Expert 分离的四条挑战分析
+- 实验 B 揭示的有害干扰假说（如 P2 验证，将是 Expert 分离必要性的最强论据）
+
+**增强贡献（取决于 P0 + P3 结果）**：
+- 训练强耦合的泛化边界（P0）
+- 三 Expert 分离双模架构（P3 原型验证）
+- RL 闭环可行性证明
+- 如果 P0 + P3 都成立：完整的"Attention 路由范式" + "三 Expert 最优架构"论证
 
 ---
 
 ## 七、总结
 
-> 机器人世界模型的跨模态交互有两种范式：JEPA 的潜空间对齐，和 WAM/VLA 的 Attention 路由。后者已被四个架构实现——COSMOS 3 和 DreamZero 位于谱的左端（全共享），FastWAM 和 π₀ 位于谱的右端（Expert 分离）。全共享架构存在有害干扰风险（实验 B），Expert 分离架构的训练耦合泛化性待验证（P0）。未来架构的核心问题是：在 Attention 路由的框架下，双模统一（VLM+DiT）能否在 Expert 分离架构中实现？最优的 Expert 分离程度在哪里？这是我们正在回答的问题。
+机器人世界模型的跨模态交互有两种范式：JEPA 的潜空间对齐，和 WAM/VLA 的 Attention 层路由。
+
+Attention 路由有四个现有实现——COSMOS 3 和 DreamZero 位于 Expert 分离谱的左端（全共享），FastWAM 和 π₀ 位于谱的右端（Expert 分离）。全共享架构面临四条挑战（推理性能受限、模态间有害干扰、频率无法分离、模态扩展代价高），Expert 分离架构在推理性能和多频率执行上已有验证，但训练强耦合的泛化性待验证。
+
+我们通过 DreamZero 上 7 组因果实验揭示了 Attention 路由的关键属性：推理弱耦合（实验 A/B/C，多维度验证）、训练强耦合（实验 D/E，在共享参数中验证）、有害干扰假说（实验 B 的反直觉结果）。基于这些证据，我们提出了三 Expert 分离双模架构（LLM + Video + Action）作为未来方向——它同时具备语义理解、世界模型、多频率执行、RL 闭环能力，是四种现有架构的自然收敛。
+
+> 核心问题：Attention 路由范式下，双模统一能否在 Expert 分离中实现？训练强耦合能否跨谱泛化？最优的 Expert 分离程度在哪里？这些问题的答案将由 P0/P1/P2/P3 实验揭晓。
