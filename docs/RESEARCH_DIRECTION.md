@@ -109,11 +109,21 @@ AR 和 DiT         仅 token 类型区分  2 Expert MoT       2 Expert LLM
 
 **COSMOS 3 是最左端——全共享。** AR Reasoner 和 DiT Generator 使用**同一组 Transformer blocks、同一组 Q/K/V/FFN 权重**。区别仅在 attention mask（causal vs full）。这与 DreamZero 的本质相同——都是共享参数——只是共享的粒度不同：COSMOS 3 是不同 mode 共享同一组 blocks，DreamZero 是 video 和 action token 共享同一组 blocks。
 
-**这个谱对架构选择有直接影响**：
+### 2.3 全共享架构面临的挑战
 
-- **偏左（共享）**：参数效率高，训练强耦合（梯度通过共享参数传播）。但存在有害干扰风险——我们在 DreamZero 上观察到全共享架构中 video denoising 对 action 产生有害表示偏移。
-- **偏右（分离）**：推理可分离（弱耦合），各模态独立优化。但训练耦合的强度未知——梯度仅通过 Attention score 矩阵中的跨模态项传播，路径间接。
-- **最优位置在哪里？** 目前左侧（COSMOS 3、DreamZero）已验证训练强耦合但存在有害干扰风险，右侧（FastWAM、π₀）已实现推理分离但训练耦合的泛化性未知。**最优解可能不在极端——但 COSMOS 3 在左端的事实意味着它也无法避免全共享的有害干扰风险。**
+全共享架构（COSMOS 3、DreamZero）虽然参数效率高、训练耦合强，但存在四个系统性问题：
+
+**1. 推理性能受限。** 所有模态的 token 必须一起通过所有 Transformer 层。即使只需要 Action 输出，Video token 也必须完成全部 forward 计算。DreamZero 的 AO 模式（跳过视频去噪）仍需要 Video token 在 16 步中去噪 16 次 Attention——这些计算没有产生任何有用的视频输出，但一个也不能省。
+
+**2. 模态间有害干扰。** 共享的 Q/K/V/FFN 权重需要同时服务不同模态的表示需求。我们的实验 B 证明：在 DreamZero 中，Video 和 Action 使用不同的噪声分布（`Beta(3,1)` vs `Uniform`），共享权重被两种冲突的去噪目标拉扯，导致 Video token 在 Attention 中对 Action token 产生有害表示偏移。替换 video latent 为纯噪声后 Action 反而改善 13%——这正是有害干扰被消除的证据。
+
+**3. 频率无法分离。** Video 去噪（16-30 步）和 Action 去噪（通常相同的步数）被绑在一起执行。无法实现 LLM ~1Hz / Video ~10Hz / Action ~50Hz 的多频率调度。每次需要新的 Action 输出，都必须跑完整的 Video + Action 联合去噪。
+
+**4. 模态扩展代价高。** 加一个新模态意味着共享权重需要重新适应新的 token 分布和噪声调度。新的模态可能与已有模态的表示需求冲突，进一步加剧有害干扰。
+
+这四条挑战解释了为什么 FastWAM 和 π₀ 选择了 Expert 分离路线——它们本质上是对全共享架构的问题的回应。但代价是训练耦合的强度未知（P0）。
+
+### 2.4 谱的架构含义
 
 ### 2.2 维度二：主干类型（VLM / DiT / 双模）
 
@@ -178,9 +188,9 @@ AR 和 DiT         仅 token 类型区分  2 Expert MoT       2 Expert LLM
 
 基于已有证据，Attention 路由路线下的最优架构应具备：
 
-**1. 适当的 Expert 分离**：全共享架构（COSMOS 3 和 DreamZero 都在谱的左端）存在有害干扰风险（实验 B）。如果 P2 在 Expert 分离架构中验证了无害干扰，则最优位置必然在谱的右侧移动。**这意味着 COSMOS 3 的全共享设计可能不是最优解——它无法避免我们在 DreamZero 上观察到的模态间有害干扰。**
+**1. Expert 分离而非全共享**：全共享架构的四条挑战——推理性能、有害干扰、频率分离、模态扩展——在 Expert 分离架构中全部可以得到缓解。FastWAM 和 π₀ 已经验证了推理性能（4× 加速）和频率分离（KV cache）。如果 P2 进一步验证了无害干扰，则 Expert 分离在四个维度上都优于全共享。**全共享架构的唯一潜在优势——训练强耦合——在 Expert 分离中的强度待 P0 验证。**
 
-**2. 双模统一与 Expert 分离的组合**：COSMOS 3 证明了双模统一可以在全共享架构中实现。未来的问题是：能否在 Expert 分离架构中实现双模统一？即 AR Reasoner 和 DiT Generator 各自独立的 Expert，通过 Joint Attention 交互，同时支持多频率分离执行。
+**2. 双模统一 + Expert 分离的组合**：COSMOS 3 证明了双模统一可以在全共享架构中实现。但实现它的同时承受了全共享的四条代价。未来的问题是：能否在 Expert 分离架构中实现双模统一？即 AR Reasoner 和 DiT Generator 各自独立的 Expert，通过 Joint Attention 交互，同时避免全共享的代价。
 
 **3. 多频率执行**：利用推理弱耦合，LLM ~1Hz、Video ~10Hz、Action ~50Hz。FastWAM 的 video KV cache 和 π₀ 的 prefix KV cache 已验证可行。
 
