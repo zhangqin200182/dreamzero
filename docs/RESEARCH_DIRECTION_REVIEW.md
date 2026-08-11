@@ -1,4 +1,4 @@
-# Attention 层对齐范式：代码级 Review（v2）
+# Attention 层对齐范式：代码级 Review（v3）
 
 > 基于对 DreamZero、FastWAM、π₀ (openpi)、COSMOS 3 四个代码库的逐层分析
 > 2026-08-11
@@ -7,237 +7,218 @@
 
 ## 摘要
 
-本文是对 `RESEARCH_DIRECTION.md` 提出的"Attention 层对齐作为独立跨模态对齐范式"的代码级 review。通过分析四个架构的实际实现，本文：
-- 验证了文档对四个架构的归类（全部正确，机制高度一致）
-- 发现 Expert 分离程度构成一个**连续谱**——这对实验结论的泛化有直接影响
-- 指出文档中一个关键的**逻辑不对称**：弱耦合从共享架构到分离架构的推断是成立的，但强耦合的同样推断不成立
-- 指出文档的核心概念混淆：Q·K^T 执行的是"信息路由"而非"表示对齐"
-- 指出 JEPA 作为对比对象的适配性问题
-- 对实验 B 的反直觉结果给出代码级解释
-- 提出路线图修正建议
+本文是对 `RESEARCH_DIRECTION.md`（最新版，已整合此前 review 反馈）的第三次代码级 review。
+
+**v3 的新内容**：
+- 评估文档对 v2 review 反馈的整合质量
+- 指出文档自我修正后产生的新张力："范式识别"（安全，已可发表）vs "范式优越性"（高影响，依赖 P0）之间的定位选择
+- 提出一个被双方档遗漏的问题：与标准 behavior cloning 的 baseline 对比
+- 将 3D Gaussian 方向纳入连续谱框架：3DGS 可以是"Video Expert 内部表示的最右端"
+- 指出文档仍然保留的两个术语问题
 
 ---
 
-## 一、四个架构的代码级确认
+## 〇、v2 Review 反馈的整合评估
 
-### 1.1 Joint Self-Attention 机制一致性（确认）
+### 已采纳
 
-四个架构的跨模态交互机制完全一致：
+| v2 反馈 | 整合情况 | 位置 |
+|---------|---------|------|
+| Expert 分离程度构成连续谱 | 完整采纳，引用 REVIEW 文档 | 3.3 节 |
+| 实验 B 的 harmful interference 解释 | 完整采纳（codec 噪声分布冲突） | 3.4 节 |
+| 实验优先级重新排序（P0-P3） | 完整采纳 | 7.1 节 |
+| 论文分层策略 | 完整采纳 | 7.3 节 |
+| Phase 3 简化方案（prefix encoding only） | 完整采纳 | 7.2 节 Phase 3 |
+| COSMOS 3 two_way_attention 参考 | 完整采纳 | 7.2 节 Phase 3 |
 
-```
-每个 Layer:
-  Expert A ──→ Q_a, K_a, V_a (各自权重) ──┐
-                                           ├── cat([Q, K, V]) → Joint Flash Attention → split → 各自 o_proj → 各自 FFN
-  Expert B ──→ Q_b, K_b, V_b (各自权重) ──┘
-```
+### 未采纳或部分采纳
 
-对齐发生在 Q·K^T 内积（无参数操作），Attention 结束后各 Expert 回到独立表示空间。**文档对此的归类是正确的。**
+| v2 反馈 | 状态 | 建议 |
+|---------|------|------|
+| "对齐" → "路由" 术语修正 | 保留"对齐" | 见第四节讨论 |
+| JEPA → "共享隐空间方法" | 保留"JEPA 路线" | 见第四节讨论 |
+| Phase 4 可实现性（GRPO 管线缺失） | 未修改 | COSMOS 3 没有 GRPO 代码——这仍然是客观事实 |
+| 3D Gaussian 方向的整合 | 未涉及 | 见第三节讨论 |
 
-### 1.2 实现差异总表
-
-| | DreamZero | FastWAM | π₀ | COSMOS 3 |
-|---|---|---|---|---|
-| **代码位置** | `wan_video_dit_action_casual_chunk.py` | `mot.py:447-556` | `gemma.py:157-249` | `transformer_cosmos3.py:49-128` |
-| **Q/K/V 权重** | 完全共享 | 完全独立 | 完全独立 | 完全独立 |
-| **FFN 权重** | 完全共享 | 完全独立 | 完全独立 | 完全独立（含 gen-only MoE） |
-| **交叉层数** | 全部 40 层 | 全部 30 层 | 全部 18 层 | 全部 36 层 |
-| **head_dim 对齐** | 天然相同 | 强制相同（24×128=3072） | 强制相同（8×256） | 强制相同 |
-| **各 Expert width** | 相同（5120） | Video 3072, Action 1024 | LLM 2048, Action 1024 | 不同 |
-| **Position Encoding** | 共享 RoPE | 各自 RoPE（Video 3D, Action 1D） | 共享 RoPE | 统一 3D mRoPE + temporal margin |
-| **Attention Mask** | 全 causal | action→video 仅第一帧 | block-causal | text=causal, gen=full |
-| **推理 KV Cache** | 无 | `prefill_video_cache` + `forward_action_with_video_cache` | prefix LLM K/V 缓存 + 10 步只用 Action Expert | Reasoner K/V 缓存，gen_only 复用 |
-
-### 1.3 收敛性证据的强度
-
-四个独立团队（GEAR Lab / 清华&上海AI Lab / NVIDIA / Physical Intelligence）、四种不同主干（Wan2.1 / Wan2.2 / Gemma2B+PaliGemma / Qwen3-VL）、三个不同时间点（2025 / 2026.3 / 2026.5），不约而同走向同一机制。**这不是巧合——文档的核心观察成立。**
+**总体评价**：文档很好地消化了 review 的核心批评（连续谱、有害干扰、实验优先级、分层策略）。self-correction 的诚实性（3.3 节承认了论证的局限性）提升了文档的可信度。剩余问题主要是术语层面和结构完整性。
 
 ---
 
-## 二、Expert 分离程度是连续谱（文档未涉及）
+## 一、新问题：文档自我修正后的定位张力
 
-### 2.1 连续谱模型
+### 1.1 两个可能的论文定位
 
-四个架构并非同质的"Expert 分离"，而是分布在一条连续谱上：
+文档在整合 review 反馈后，产生了一个尚未被明确识别的张力：
+
+**定位 A：范式识别论文**
+- 核心贡献："Attention 层对齐是一种以前未被识别的独立范式"
+- 证据：四个架构的收敛性 + 推理弱耦合的通用性
+- 风险：低。代码已确认，四个架构的推理策略一致
+- 影响：中等。"我们命名了一个现象" vs "我们发现了一个现象"
+
+**定位 B：范式优越性论文**
+- 核心贡献："Attention 对齐优于共享隐空间方法，因为它同时具备推理弱耦合和训练强耦合"
+- 证据：需要 P0 实验（强耦合在 Expert 分离架构中成立）
+- 风险：高。P0 可能不成立
+- 影响：高。如果成立，这是一个 architecture-level 的贡献
+
+当前文档在两个定位之间摇摆。摘要（第 20 行）和第五章声称"Attention 层对齐是更优的方案"，但 3.3 节承认了强耦合泛化的不确定性。**这两个声明不能同时成立**——如果你不确定强耦合是否泛化，你就不能声称"更优"。
+
+### 1.2 建议：明确选择定位 B，但以定位 A 为 fallback
 
 ```
-全共享 ←────────────────────────────────────────────────→ 全分离（不同 attention mode）
+论文结构建议：
 
-DreamZero            FastWAM                π₀                    COSMOS 3
-  │                     │                    │                       │
-  Q/K/V/FFN 全共享      Q/K/V/FFN 全独立     Q/K/V/FFN 全独立       Q/K/V/FFN 全独立
-  仅 token 类型区分      但 dim 强制对齐        width 不同             und/gen 不同 attention
-                         (3072=3072)          仅 head_dim=256 对齐    mode (causal vs full)
-                         RoPE 各自独立         共享 RoPE              gen 有独立 MoE router
+  主贡献（定位 A，已可写）：
+    "Attention 层路由是一种独立的跨模态交互范式"
+    - 代码级收敛性证据
+    - 推理弱耦合的通用性验证
+    - 多频率分离推理的自然推论
+
+  延伸发现（定位 B，P0 决定取舍）：
+    "在特定条件下（共享参数 / 特定 Expert 分离程度），
+     这种范式同时具备训练强耦合"
+    - 如果 P0 成立 → 直接扩展为"范式优越性"
+    - 如果 P0 不成立 → 降级为"共享参数的特例"，不影响主贡献
+
+  Discussion/Future Work：
+    - 3D Gaussian 结构化表示 + Attention 路由的组合方向
+    - 三专家架构
 ```
 
-### 2.2 这对文档论证策略的影响
+这样写的好处：**P0 的结果不影响论文的可发表性**，只影响论文的 ceiling。定位 A 已经足够支撑一篇 solid 的 paper。
 
-文档第 100 行给出的逻辑是：
-> "选择 DreamZero 的原因：它是唯一没有 Expert 分离的全共享 DiT 架构...如果在此最'紧'的架构中仍观察到弱耦合，则 Expert 分离的架构中更应成立。"
+---
 
-这个逻辑对**弱耦合**成立：共享参数下输出质量都不传递，分离参数下更不可能传递。但文档隐含地将同样的逻辑用在了**强耦合**上——在第 151 行直接得出"Video loss 的梯度通过共享 Attention 权重传播到 action"的统一结论——这只是共享参数的产物，对 Expert 分离架构完全不适用。
+## 二、一个双方档都缺失的对比：标准 Behavior Cloning 基线
 
-**核心逻辑不对称**：
+### 2.1 问题
 
-| | 弱耦合（推理） | 强耦合（训练） |
+两个文档都在比较"范式 B（Attention 路由）"与"范式 A（JEPA/共享隐空间）"。但在机器人学习领域，**实际的默认基线既不是 JEPA 也不是 Attention 路由**，而是标准 behavior cloning：
+
+```
+标准 BC 架构：
+  Vision Encoder (ResNet/ViT) ──→ concat(language, state) ──→ Action Decoder (MLP/Transformer)
+```
+
+这个架构的特征是：
+- 所有模态的表示在 encoder 输出处 concat
+- 没有迭代的跨模态交互（单 pass）
+- 没有 Expert 概念
+
+**标准 BC 实际上更接近范式 A**（共享隐空间，只是空间很小），但范式 A 的讨论对象 JEPA 是专门做自监督学习的——BC 和 JEPA 在目的、规模、训练方式上都完全不同。
+
+### 2.2 为什么需要这个对比
+
+1. **实用角度**：如果你的目标是说服机器人社区采用 Attention 路由，你需要证明它优于当前的 BC 基线，而不仅仅是优于 JEPA
+2. **谱系完整性**：BC → 共享 Encoder（范式 A 的实用版本）→ JEPA（范式 A 的理论版本）→ DreamZero 全共享 DiT → FastWAM Expert 分离 → π₀ Expert+width 分离 → COSMOS 3 全分离。这是一个从简单到复杂的完整进化谱系
+3. **Motivation 强化**：简单 BC 有明确的 failure mode（单一 pass 无法迭代推理，所有模态共享同一表示压缩），Attention 路由恰好解决这些问题。这个 motivation 比"我们与 JEPA 不同"更接地气
+
+### 2.3 建议
+
+在第四章（范式 B 的应用）之前，增加一个简短的 BC baseline 分析：范式 B 的三个优势（多频率执行、预训练复用、迭代交互）直接对治 BC 的局限。
+
+---
+
+## 三、3D Gaussian 方向如何纳入更新后的文档
+
+### 3.1 当前文档的状态
+
+文档 3.3 节建立了连续谱框架，但仅限于四个已有架构的排列。3D Gaussian 方向可以自然地扩展这个框架：
+
+```
+表示层面的连续谱（以 Video Expert 为例）：
+
+  无结构向量 ──────────────→ 结构化特征图 ──────────────→ 显式几何表示
+
+  Wan2.1 VAE latent      ViT feature tokens           3D Gaussian Splatting
+  (16×H×W, compressed)   (patch embeddings)           (means + cov + features)
+  DreamZero / FastWAM                                (同事的提案)
+```
+
+### 3.2 与已有框架的兼容性
+
+3DGS 不改变 Attention 路由机制——它改变的是 Video Expert **内部**的表示格式。两者的关系是：
+
+```
+                                   Expert 分离程度（架构轴）
+                                   ←────────────────────→
+                                   全共享          全分离
+
+  Video Expert         无结构 latent   DreamZero     FastWAM
+  内部表示              ───────────────────────────────────
+  （表示轴）            结构特征图        —           COSMOS 3?
+      │
+      ↓               3D Gaussian        —           [组合方案]
+```
+
+3DGS 填的是表格的右下角——在 Expert 分离的架构中用结构化几何表示作为 Video Expert 的内部 latent。
+
+### 3.3 建议的文档整合
+
+在 3.3 节（连续谱）中增加一段：连续谱不仅存在于"架构层"（Expert 分离程度），也存在于"表示层"（latent 的结构化程度）。两者是正交的设计维度，3D Gaussian 是表示层最右端的候选方案。
+
+在第四章增加 4.4 节："扩展性：Expert 内部表示的可替换性"，论证 Attention 路由框架允许自由替换各 Expert 的内部表示而不影响跨模态交互机制——这是共享隐空间方法做不到的。
+
+---
+
+## 四、剩余术语问题
+
+### 4.1 "对齐" vs "路由"
+
+文档仍使用"Attention 层对齐"。从代码实现看，Q·K^T 执行的是信息路由（决定每个 token 从哪些其他 token 聚合信息），而非表示对齐（将不同表示拉到同一空间建立对应关系）。
+
+两个术语的关键区别：
+
+| | 对齐 (Alignment) | 路由 (Routing) |
 |---|---|---|
-| DreamZero 观察到 | ✓（video 输出不影响 action） | ✓（video loss → action loss 下降） |
-| 泛化到 Expert 分离的推断 | **成立**：共享参数下都不传递质量，分离更不传递 | **不成立**：共享参数的梯度路径 ≠ Attention 的梯度路径 |
+| 做什么 | 将 A 和 B 拉到同一空间 | 决定 A 从 B 取多少信息 |
+| 结果 | A 和 B 可以互换 | A 和 B 仍在各自空间 |
+| 典型例子 | CLIP contrastive, JEPA | Attention, MoE gating |
+| 信息损失 | 有（投影到统一维度） | 无（各自保留） |
+
+**JEPA 做的是表示对齐，Attention 做的是信息路由。它们在逻辑层面是正交的。** 把 Attention 称为"对齐"会让读者产生错误的类比——以为 Attention 也在试图把不同模态的表示拉到同一个空间。
+
+如果担心"路由"这个术语不够成熟，可以用**"Attention 层跨模态交互"**作为过渡——比"对齐"更中立，比"路由"更不容易引起争议。
+
+### 4.2 JEPA vs "共享隐空间方法"
+
+文档仍将对比对象称为"JEPA 路线"。JEPA 的核心贡献是同模态自监督表示学习（从部分预测整体），跨模态扩展并非 JEPA 的主线。
+
+当前对比实际上针对的是"把所有模态投影到统一隐空间"这一类方法。建议改为"共享隐空间方法（如 JEPA、CLIP、多模态 LLM projection layer）"，既更准确，也为 3D Gaussian 结构化隐空间留出概念空间。
 
 ---
 
-## 三、梯度路径分析：强耦合能否泛化？（文档未区分）
+## 五、综合评审意见
 
-### 3.1 四种架构中 video loss → action 的梯度路径
+### 文档的优势（v3 强化项）
 
-**DreamZero（全共享权重）**：
-```
-video_loss → ∂/∂(shared_QKV_weight) → 直接影响 action 的 forward
-```
-梯度通过**完全相同的参数**传播。实验 D/E 验证的是"共享参数耦合"，不是"Attention 耦合"。
+1. **诚实性显著提升**：3.3 节的自我修正（承认连续谱和推断局限）使文档从"manifesto"升级为"research proposal"
+2. **可执行性提升**：P0-P3 优先级和分层论文策略使路线图不再是一厢情愿的列表
+3. **代码级可信度**：实验 B 的重新解释基于具体的 codec noise schedule 分析，而非模糊的直觉
 
-**FastWAM（独立 Q/K/V/FFN）**：
-```
-video_loss → ∂L/∂(video_attn_output) → [仅通过 softmax 中 video_Q · action_K^T] → ∂L/∂(action_K_weight)
-```
-这是一条间接且可能极弱的梯度路径——梯度不经过 action expert 的参数，只通过 attention score 矩阵中的交叉项。
+### 仍需要处理的问题（按优先级）
 
-**π₀（独立 Q/K/V/FFN + 不同 width）**：
-```
-LLM_loss → ∂L/∂(LLM_attn_output) → [仅通过 softmax 中 LLM_Q · action_K^T] → ∂L/∂(action_K_weight)
-```
-耦合更弱——两边表示空间维度不同（2048 vs 1024），仅在 256-dim head 空间交互。
-
-**COSMOS 3（独立路径 + 不同 attention mode）**：
-```
-gen_loss → ∂L/∂(gen_attn_output) → [仅 gen→und cross-attn 中的 und_K] → ∂L/∂(und_K_proj)
-```
-在 `three_way_attention` 中显式拆分，耦合仅存在于 gen→und 的 cross-attention 路径。
-
-### 3.2 结论
-
-**"训练强耦合是 Attention 对齐的通用属性"是当前框架中最大且最关键的待验证假设。** 在 DreamZero 上观察到的强耦合来自共享参数，该结论能否推广到 Expert 分离架构，完全取决于间接梯度路径的强度——这个强度目前是未知的。
-
-**这是 P0 优先实验。**
-
----
-
-## 四、概念精确性：两个需要修正的问题
-
-### 4.1 "对齐" vs "路由"——核心概念的混淆
-
-文档将 Q·K^T 描述为跨模态"对齐"机制。但从代码实现来看，Q·K^T 实际执行的是**信息路由**（information routing），而非表示对齐（representation alignment）：
-
-- **对齐**意味着将两种表示拉到同一个空间、建立对应关系（如 CLIP 的对比学习使 image 和 text embedding 可互换）
-- **路由**意味着根据相似度有选择地传递信息（如 softmax(QK^T) 使每个 token 从其他 token 聚合信息）
-
-在 Attention 中，各 Expert 的表示在 Attention 前后保持在各自的独立空间中，Q·K^T 只是决定"从哪个 Expert 取多少信息"。称为"路由"比"对齐"更精确。
-
-**建议**：文档的核心术语可以从"Attention 层对齐"改为"Attention 层跨模态路由"，或者至少在引言中区分这两个概念。这会让理论框架更精准，也避免与 JEPA 的"对齐"概念产生范畴混淆——JEPA 做的是表示对齐，Attention 做的是信息路由，它们在逻辑层次上是正交的，不是直接竞争的。
-
-### 4.2 JEPA 作为对比对象的适配性
-
-文档将 JEPA 设为对立范式。但 JEPA 的核心贡献是**同模态自监督学习**（从图像的一部分预测另一部分），跨模态扩展（multi-modal JEPA）在 JEPA 文献中并非主线。
-
-更准确的对比对象应该是**共享隐空间方法**这个更宽泛的类别，包括：
-- CLIP-style 对比学习（image-text shared space）
-- 多模态 LLM 的 projection layer（将 vision/audio 投影到 LLM token space）
-- JEPA 的 shared latent（同模态或跨模态）
-
-将对比对象从"JEPA"扩大为"共享隐空间方法"，论证会更稳健，也不会陷入"JEPA 到底是不是做跨模态"的争议。
-
----
-
-## 五、实验 B 反直觉结果：代码级解释
-
-### 5.1 现象
-
-Random/zero latent 替换 video latent 后，action MSE 反而**下降 13%**（21.61 → 18.69）。
-
-### 5.2 基于代码的解释
-
-DreamZero 使用**独立 per-token noise schedule**——Video: `Beta(3,1)`（偏低压噪声），Action: `Uniform`。两种噪声分布差异意味着共享的 Q/K/V 权重需要同时服务两种不同的 denoising 动态。Video 的 noisy latent 在 joint attention 中对 action token 产生了**有害的表示偏移**——共享权重被两种冲突的降噪目标拉扯。
-
-Random/zero latent 消除了这种冲突，所以 action 精度反而提升。替换第一帧（CLIP 编码）几乎无影响，因为 CLIP 特征是冻结的，不参与 denoising 动态。
-
-### 5.3 推论
-
-在共享 DiT 架构中，video denoising 对 action 是 **harmful（而非 neutral）** 的。这意味着 Attention 层的 Expert 分离不仅是"可选的优化"，而是**防止模态间有害干扰的必要设计**。
-
-**验证实验**：在 Expert 分离架构（FastWAM 或 π₀）中做同样的 random latent 替换。如果不存在 harmful 效应，这本身就是范式 B 相对于全共享架构的重要优势证据。
-
----
-
-## 六、路线图修正建议
-
-### 6.1 实验优先级重新排序
-
-| 优先级 | 实验 | 验证问题 | 风险 |
-|--------|------|---------|------|
-| **P0** | π₀ 梯度传播实验（平行 DreamZero D/E） | 强耦合是否泛化到 Expert 分离架构？ | **高**——如果不存在，框架需重大修正 |
-| **P1** | π₀ prefix 扰动实验（平行 DreamZero A/C） | 弱耦合是否泛化？ | 低——已有主动弱耦合代码证据 |
-| **P2** | Expert 分离架构的 random latent 替换 | Expert 分离中是否存在 harmful 干扰？ | 低——预期无害 |
-| **P3** | FastWAM 梯度传播实验 | 纯 DiT Expert 分离的中间验证 | 中 |
-
-### 6.2 Phase 3 实际架构风险
-
-从 π₀ (AR LLM + Diffusion Action) 加 Video DiT Expert 时，面临 generation paradigm 冲突：
-- LLM：autoregressive，causal attention
-- Video DiT：diffusion，bidirectional attention
-
-COSMOS 3 用 `two_way_attention` / `three_way_attention` 解决。简化方案：Video Expert 只做 prefix 编码（类似 π₀ 中的 SigLIP / FastWAM 的 `prefill_video_cache`），不参与 diffusion rollout。
-
-### 6.3 Phase 4 可实现性
-
-COSMOS 3 代码中**不存在 GRPO 管线**——目前仅有 SFT post-training（`action/posttrain_config/*`）。从零构建 GRPO + forward dynamics rollout + reasoner-based reward 的工程量远超 8-12 周。建议 Phase 4 的范围明确为"在 COSMOS 3 上做 SFT-based 前向动态训练"，GRPO 作为 Phase 5+ 的扩展。
-
-### 6.4 论文定位策略
-
-**已验证（立即可写）**：
-- Attention 层跨模态路由是一种独立于共享隐空间的范式（四个架构代码证据）
-- 推理弱耦合是其通用属性（四个架构推理策略一致，FastWAM/π₀ 主动采用）
-- 多频率分离推理是自然推论
-
-**待验证（决定论文上限）**：
-- 训练强耦合的泛化边界（P0 决定）
-- Expert 分离 vs 全共享的优劣对比（P2 决定）
-- 三专家架构可行性（Phase 3 决定）
-
----
-
-## 七、补充代码发现
-
-### 7.1 FastWAM 的 Action Expert 初始化
-
-`scripts/preprocess_action_dit_backbone.py`：Action Expert 权重从 Video DiT 通过线性插值初始化（`alpha = sqrt(d_src/d_dst)`）。初始表示空间是 Video Expert 空间的低维投影，确保训练初期 Q·K^T 内积有意义。如果 Expert 随机初始化，Attention 路由可能需要更长 warm-up。
-
-### 7.2 π₀ 的 adaRMS：独立时间条件
-
-`gemma.py:112-131`：Action Expert 每层 RMSNorm 接受 timestep MLP 调制（`use_adarms=[False, True]`，LLM=False, Action=True）。扩散时间条件仅影响 Action Expert 的表示，不影响 LLM。**Expert 分离不仅体现在 Attention 层，也体现在 Normalization 层。**
-
-### 7.3 独立噪声调度是通用设计
-
-COSMOS 3 每个模态拥有独立 timestep 分布和 noise schedule，与 DreamZero 的 per-token sigma 采样一致。Attention 路由天然支持多频率/多噪声水平的独立调度——这是共享隐空间方法做不到的。
-
----
-
-## 八、综合评估
-
-### 文档的优势
-
-1. **核心观察敏锐且正确**：四个独立架构的代码级一致性提供了非常强的收敛性证据
-2. **理论框架简洁**：弱耦合 + 强耦合两个属性抓住了 Attention 路由的本质
-3. **路线图有层次**：从验证到原型到应用的递进清晰
-
-### 需要修正或注意的问题
-
-1. **强耦合泛化未验证（关键）**：DreamZero 的强耦合来自共享参数，不是来自 Attention 机制。P0 实验优先
-2. **"对齐" vs "路由"概念混淆**：建议使用"Attention 层跨模态路由"以更精确描述机制
-3. **JEPA 对比适配性**：建议扩大为"共享隐空间方法"类别
-4. **Phase 4 时间估计偏低**：COSMOS 3 无 GRPO 管线，从零构建工程量大于 8-12 周
-5. **Expert 分离程度未被建模**：文档隐含地将四个架构视为同质，但它们落在连续谱上
-6. **实验 B 的 harmful 效应未被重视**：这可能是最锋利的论据——证明 Expert 分离是必要设计而非可选优化
+| 优先级 | 问题 | 影响 |
+|--------|------|------|
+| **高** | 定位张力：范式识别 vs 范式优越性 | 决定论文叙事逻辑和实验策略 |
+| **高** | 缺少 BC baseline 对比 | 决定论文与机器人社区的相关性 |
+| **中** | "对齐" vs "路由"术语 | 影响理论框架的精确性和可辩护性 |
+| **中** | JEPA vs 共享隐空间的对比范畴 | 影响与相关工作的区分度 |
+| **中** | 3D Gaussian 方向的整合 | 丰富 Discussion，证明框架扩展性 |
+| **低** | Phase 4 可实现性 | COSMOS 3 无 GRPO 管线仍是客观事实 |
 
 ### 一句话总结
 
-**方向正确，核心观察可靠，但"强耦合泛化"是当前理论框架的阿喀琉斯之踵——它决定了论文的上限。** 优先在 π₀ 上验证，根据结果决定最终定位。
+**文档在消化 review 后从一个"宣言"进化为一个"研究提案"——更诚实、更可执行。现在的核心决策是选择"范式识别"作为论文底线（安全），同时将"范式优越性"作为 P0 实验的 upside（高回报），而不是把两者绑在一起。** 如果是我，我会先按定位 A 写一个完整的 draft，P0 实验完成后再决定是否升级为定位 B。
+
+### 附录：如果 P0 实验失败（强耦合不泛化）的 Plan B
+
+这不是悲观，是学术严谨。如果 π₀ 上的梯度传播实验显示 LLM loss 对 action loss 无影响，文档的修正方案：
+
+1. 将"训练强耦合"重新定义为**共享参数架构的特性**，而非 Attention 路由的特性
+2. 将"推理弱耦合"提升为**Attention 路由的唯一定义属性**
+3. 将 harmful interference 假说（实验 B）提升为**主要 motivation**：为什么需要 Expert 分离？因为共享参数下不同模态互相干扰
+4. 论文的 narrative 变为："我们发现了共享参数多模态架构中的 harmful interference 问题。四个独立团队不约而同地走向了同一个解决方案——Attention 层 Expert 分离。我们将其识别为一种独立范式，并系统验证了其推理弱耦合属性。"
+
+这个 Plan B 的 paper 仍然可以发，而且可能是更扎实的 paper——因为它解释了 WHY（harmful interference → Expert 分离的必要性），而不仅仅是 THAT（四个团队偶然走向了同一方案）。
