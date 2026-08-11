@@ -196,7 +196,7 @@ FastWAM 和 π₀ 选择了不同的"缺失能力"作为代价：
 
 ### 3.4 第三种方案：三 Expert 分离 + 双模统一
 
-既然全共享架构可以同时容纳 LLM 和 DiT（COSMOS 3 已证明），Expert 分离架构也应该可以。将 π₀ 的 LLM Expert 和 FastWAM 的 Video Expert 组合：
+既然全共享架构可以同时容纳 LLM 和 DiT（COSMOS 3 已证明），Expert 分离架构也应该可以。从 FastWAM（Video + Action Expert 分离）出发，加 LLM Expert：
 
 ```
 Layer i:
@@ -279,7 +279,7 @@ Critic / Reward    →    LLM Expert（观看生成的视频 → "任务完成�
 | **RL 闭环** | 基础设施完备（FD rollout + Reasoner），但无 GRPO | 有 FD rollout，无语义 reward | 无语义 reward 来源 | **完整：FD rollout + Reasoner + GRPO** |
 | **训练耦合** | 有（共享参数） | 未知（P0 待验证） | 未知（P0 待验证） | 未知（P0 待验证） |
 
-**核心风险**：三 Expert 的训练资源需求显著高于双 Expert 方案。务实起点：从 π₀（LLM + Action, 已开源, 有 PyTorch port）出发，加 Video Expert（LoRA fine-tune，冻结 LLM 和 Video 主干）。
+**核心风险**：三 Expert 的训练资源需求显著高于双 Expert 方案。务实起点：从 FastWAM（Video + Action, 已有 Expert 分离 + KV cache）出发，加 LLM Expert。渐进升级——先用冻结 T5/CLIP 做轻量语义编码，验证目标 1-3；如果 F5 成立（强耦合泛化），再升级完整 AR LLM 做目标 4。
 
 ---
 
@@ -417,9 +417,22 @@ Layer i:
 | 推理执行 | 所有模态必须一起 forward | 各 Expert 独立频率，K/V 缓存复用 |
 | 有害干扰 | 存在风险（全共享） | 预期消除（Expert 分离） |
 
-**务实起点（路线 A）**：从 π₀ (LLM + Action, 已开源, PyTorch port) 出发，加 Video Expert（Wan2.2-5B 或冻结主干，LoRA fine-tune）。仅需训练新增 Expert 的 LoRA 权重，LLM 和 Action Expert 的预训练权重保留。
+**务实起点（推荐，从 FastWAM 出发）**：FastWAM 已有 DiT-DiT Expert 分离 + video KV cache + action 独立去噪——这是目标 3（多频率）的完整基础设施。加 LLM Expert 采用渐进策略：
 
-**备选起点（路线 B）**：从 FastWAM (Video + Action) 出发，加 LLM Expert（PaliGemma 2B，冻结主干）。需额外处理 generation paradigm 冲突（AR vs DiT 的 attention mask 不同），可参考 COSMOS 3 的 two_way_attention。
+```
+阶段 1（目标 1-3）：轻量 LLM = 冻结 T5/CLIP 编码器
+  → 不做 AR generation，仅通过 cross-attention 注入语义信息
+  → 不需要处理 AR vs DiT 的 attention mask 冲突
+  → 可以立即验证多频率（F1-F4）+ 全模态能力（Policy/FD/ID）
+
+阶段 2（目标 4，取决于 FastWAM F5 结果）：
+  → 如果 F5 成立（强耦合泛化）：升级完整 AR LLM（PaliGemma 2B 或 Gemma 2B）
+    → 用 block-causal mask 避免 AR vs DiT 冲突（Phase 1 LLM 单独执行）
+    → LLM 提供语义 reward → GRPO 闭环
+  → 如果 F5 不成立：轻量 LLM 足够，放弃目标 4
+```
+
+**路线 B（从 π₀ 出发，备选）**：π₀ (LLM + Action Expert) 已有语义理解能力。加 Video Expert 需处理 AR vs DiT 的 mask 冲突，且需从零搭建 video KV cache 基础设施——这不是 π₀ 原有的能力。
 
 ### 5.2 目标二：证明全模态能力——继承 COSMOS 3 的全部功能
 
@@ -434,31 +447,79 @@ Layer i:
 
 每个模式只用到需要的 Expert——无关 Expert 不参与 forward，不引入不必要的噪声干扰。
 
-### 5.3 目标三：证明多频率优势——推理精度不降 + 延迟降低
+### 5.3 目标三：证明多频率优势——推理精度不降 + 语义理解加持
 
-**做什么**：利用弱耦合，验证三类 Expert 以不同频率独立执行时 Action 精度不退化。
+**做什么**：利用弱耦合 + 多频率分离执行，实现推理精度不变、延迟降低、且 LLM 层提供真正的语义理解能力。
+
+**为什么 AR LLM 是多频率的关键收益**：
+
+多频率不是"跳过 Video/Action 计算"那么简单。LLM 层提供的是**真正的语言理解和任务推理**——这和 T5/CLIP 的文本嵌入有本质区别：
 
 ```
-语义层（LLM Expert）：       ★               ★               ★
-  "任务是什么？"               ↑ ~1 Hz（K_l/V_l 缓存复用）
+T5 编码："wipe the countertop from the stain near the sink"
+  → 一个 5120-dim 的文本向量，编码了"语义相似性"
+  → 无法区分"擦水池边的污渍"和"擦桌上的水"
 
-视觉层（Video Expert）：     ★─★─★─★─★─★─★─★─★─★─★─★
-  "接下来画面变什么样？"        ↑ ~10 Hz（K_v/V_v 缓存复用）
-
-动作层（Action Expert）：    ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-  "具体关节位置？"             ↑ ~50 Hz（仅 forward Action Expert）
+AR LLM："wipe the countertop from the stain near the sink"
+  → 理解"水池边"的空间位置、"污渍"的视觉特征、"从左到右"的动作规划
+  → 为 Video 和 Action 提供精准的多步任务约束
 ```
 
-每步 Action 去噪只需 Action Expert 的 forward + O(1) 读取 LLM/Video 的缓存 K/V。
+这种语义泛化能力在未见过的任务指令上尤为关键——T5/CLIP 只能处理训练数据中见过的表述，AR LLM 可以推理新的表述。
+
+**如何实现——Block-Causal Mask 避免 AR vs DiT 冲突**：
+
+π₀ 已经给出了解决方案。LLM 和 DiT Expert 不在同一时刻 forward——使用分阶段执行 + block-causal attention mask：
+
+```
+Phase 1: LLM forward（1 次，causal attention on 自己的 tokens）
+  "wipe the countertop, starting from the stain near the sink"
+  → 可生成推理链（chain-of-thought）
+  → 缓存 18 层 K_l, V_l
+
+Phase 2: Video forward（~10Hz, full attention）
+  用缓存的 K_l, V_l 作为语义条件
+  → 生成未来视频或编码当前帧
+  → 缓存 K_v, V_v
+
+Phase 3: Action 去噪（~50Hz, 10-30 步）
+  每步仅 Action Expert forward + 读缓存 K_l, V_l + K_v, V_v
+  Block-causal mask: Action 可以 attend 到 LLM + Video prefix
+                     LLM/Video 不 attend 到 Action
+```
+
+**不存在 AR vs DiT 的 attention mask 冲突**——因为 LLM 在 Phase 1 单独执行（causal），Video 和 Action 在 Phase 2/3 执行（DiT full attention），它们不在同一 forward 中共存。这与 COSMOS 3 的全共享方案（同一组 blocks 需要在 forward 中同时处理 causal 和 full attention）有本质区别。
+
+**多频率执行的效果**：
+
+```
+LLM Expert：       ★               ★               ★
+  语义理解+任务规划   ↑ ~1 Hz（仅任务切换时重新推理，K_l/V_l 缓存）
+
+Video Expert：     ★─★─★─★─★─★─★─★─★─★─★─★
+  视觉预测           ↑ ~10 Hz（画面变化时刷新，K_v/V_v 缓存）
+
+Action Expert：    ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+  实时动作执行        ↑ ~50 Hz（每步仅 Action Expert forward + O(1) 读缓存）
+```
+
+| | T5 编码（DreamZero/FastWAM） | AR LLM（三 Expert） |
+|---|---|---|
+| **语言理解深度** | 浅（固定文本嵌入） | 深（上下文推理 + 链式思考） |
+| **未见指令泛化** | 弱（依赖训练数据覆盖） | 强（LLM 的零样本推理能力） |
+| **多步任务规划** | ✗ | ✓（可以生成子任务序列） |
+| **对 Video 的约束** | 隐式（嵌入影响 attention） | 显式（语义分解为视觉约束） |
 
 **已有证据**：
 - FastWAM：video KV cache + action 独立去噪 → 精度不变，延迟 4× 降低
-- π₀：prefix KV cache + action 独立去噪 → 精度不变
-- 我们的实验 A/B/C：视频输出质量不影响 action 精度
+- π₀：prefix KV cache + action 独立去噪 + 语义理解（Gemma 2B）→ 精度不变
+- 我们的实验 A/B/C：视频输出质量不影响 action 精度（弱耦合验证）
 
-**待验证实验**：
-- P1：π₀ prefix 扰动 → 验证 VLA 架构中的弱耦合
-- Phase 3 原型：三 Expert 多频率执行 → 验证精度无退化
+**待验证实验**（FastWAM F1-F4）：
+- F1：分离推理 vs 联合推理的 Action 精度对比
+- F2：K/V 缓存的持久性（频率鲁棒性）
+- F3：视频 K/V 刷新策略消融
+- F4：与 π₀ 多频率效率对比
 
 ### 5.4 目标四：证明 RL 闭环——在想象中学习，无需真机
 
@@ -621,35 +682,41 @@ Phase 4:
 
 先导实验完成后，基于结果选择构建路线。
 
-**主路线（路线 A：从 π₀ 出发，推荐）**：
+**推荐路线（从 FastWAM 出发，渐进升级）**：
 
 ```
-π₀ (LLM 2B + Action 300M, 18 layers, JAX/PyTorch)
-  → 加 Video Expert（Wan2.2-5B 或冻结主干）
-  → 三 Expert Joint Self-Attention（每层 cat Q/K/V, Flash Attention）
-  → LoRA fine-tune（仅训练新增的 Video Expert + Action Expert 的 LoRA）
-  → LLM Expert 冻结（PaliGemma 预训练权重保留）
+阶段 1（目标 1-3，Phase 3）：
+  FastWAM (Video 5B + Action 1B, 30 layers)
+    → 加轻量 LLM Expert（冻结 T5/CLIP 编码器）
+    → 通过 cross-attention 注入语义信息（不做 AR generation）
+    → 不需要处理 AR vs DiT mask 冲突
+    → 立即可以验证：多频率（F1-F4）+ 全模态能力（Policy/FD/ID）
+
+阶段 2（目标 4，取决于 FastWAM F5）：
+  → 如果 F5 成立：轻量 LLM → 升级完整 AR LLM（PaliGemma 2B 或 Gemma 2B）
+    → 用 block-causal mask（π₀ 方案）：
+      Phase 1: LLM 单独 forward（causal, 1 次）→ 缓存 K_l, V_l
+      Phase 2/3: Video + Action forward（full attention）+ 读 K_l, V_l
+    → LLM 提供语义 reward → GRPO 闭环
+  → 如果 F5 不成立：轻量 LLM 足够，放弃目标 4
 ```
 
-**关键工程决策**：
+**LLM 升级的 gate decision**：
 
-| 决策点 | 选项 | 推荐 |
-|--------|------|------|
-| Video Expert 来源 | Wan2.2-5B / 冻结轻量 DiT / 从零训练 | Wan2.2-5B 冻结主干 + LoRA |
-| Joint Attention 实现 | 拼接 Q/K/V（FastWAM 方式） | 拼接 Q/K/V——已有代码参考 |
-| 训练策略 | 全量 fine-tune / LoRA Expert / 冻结 LLM | LoRA Action + Video，冻结 LLM |
-| AR vs DiT 冲突 | 是否处理 LLM causal 和 DiT bidirectional 的 mask 冲突？ | 初期不做 Video diffusion rollout——Video Expert 只做 prefix 编码（prefill_video_cache），不生成未来视频 |
+| 条件 | 行动 | 论文定位 |
+|------|------|---------|
+| FastWAM F5 成立 | 升级完整 AR LLM | 目标 1-4 全验证 |
+| FastWAM F5 不成立 | 保持轻量 LLM | 目标 1-3（强耦合限于全共享） |
 
-**备选路线（路线 B：从 FastWAM 出发）**：
+**为什么从 FastWAM 出发而非 π₀**：
 
-```
-FastWAM (Video 5B + Action 1B, 30 layers)
-  → 加 LLM Expert（PaliGemma 2B 或冻结主干）
-  → 需额外处理 AR vs DiT 的 attention mask 冲突
-  → 可参考 COSMOS 3 的 two_way_attention 方案
-```
-
-路线 A 更务实——不需要解决 AR vs DiT 的 attention mask 冲突（初期 Video Expert 不做 diffusion rollout）。
+| | 从 FastWAM 出发 | 从 π₀ 出发 |
+|---|---|---|
+| Expert 分离 | ✓ 已有（DiT-DiT） | ✓ 已有（LLM-DiT） |
+| 多频率基础设施 | ✓ 已有（video KV cache） | 部分（只有 LLM KV cache） |
+| 加新 Expert | 加轻量 LLM（无 mask 冲突） | 加 Video DiT（需处理 mask 冲突） |
+| 目标 3 验证 | **立即可测 F1-F4** | 需先搭建 video KV cache |
+| P0 验证 | **F5 直接测 DiT-DiT 梯度耦合** | 需加 Video Expert 后才能测 |
 
 ---
 
