@@ -155,7 +155,73 @@ AR 和 DiT         仅 token 类型区分  2 Expert MoT       2 Expert LLM
 
 ---
 
-## 三、实验发现：Attention 路由的耦合属性
+## 三、未来的架构方向：FastWAM、π₀、还是新的综合？
+
+我们已经认识到 Expert 分离优于全共享（四个挑战），且全共享架构（COSMOS 3、DreamZero）和 Expert 分离架构（FastWAM、π₀）都位于谱上。那么下一步架构应该走向哪里？
+
+### 3.1 FastWAM 方案：DiT + Action Expert（世界模型优先）
+
+```
+Video Expert (DiT 30层) ──→ Q_v, K_v, V_v ──┐
+                                               ├── Joint Attention ──→ Video 输出 + Action 输出
+Action Expert (DiT 30层) ─→ Q_a, K_a, V_a ──┘
+
+优势：可以生成未来视频（世界模型），支持 forward dynamics + policy + inverse dynamics
+      已验证推理加速（video KV cache → action 独立去噪，4× speedup）
+局限：没有语言推理能力，文本仅通过 T5 cross-attention 注入（弱语义理解）
+```
+
+### 3.2 π₀ 方案：LLM + Action Expert（语义理解优先）
+
+```
+LLM Expert (Gemma 2B 18层) ──→ Q_l, K_l, V_l ──┐
+                                                  ├── Joint Attention ──→ Action 输出
+Action Expert (300M 18层) ───→ Q_a, K_a, V_a ──┘
+
+优势：原生语言推理（任务规划、常识判断），已验证 prefix KV cache + action 独立去噪
+局限：不生成视频（无法做世界模型式的 rollout 想象），模型较小（2B+300M vs DiT 的 5B-14B）
+```
+
+### 3.3 两方案的本质差异：能力边界 vs 语义深度
+
+FastWAM 和 π₀ 选择了不同的"缺失能力"作为代价：
+
+| | FastWAM | π₀ |
+|---|---|---|
+| **有什么** | 视频生成（世界模型） | 语言推理（任务理解） |
+| **缺什么** | 语义推理 | 视觉未来预测 |
+| **优势场景** | 需要 rollout 想象的环境 | 需要语言理解的任务 |
+| **适合 RL** | ✓（有世界模型，可以 rollout） | ✗（无视频生成，只能 BC） |
+| **适合推理加速** | ✓ | ✓ |
+
+### 3.4 第三种方案：三 Expert 分离 + 双模统一
+
+既然全共享架构可以同时容纳 LLM 和 DiT（COSMOS 3 已证明），Expert 分离架构也应该可以。将 π₀ 的 LLM Expert 和 FastWAM 的 Video Expert 组合：
+
+```
+Layer i:
+
+  LLM Expert (AR, causal)    Video Expert (DiT, diff)    Action Expert (DiT, diff)
+  Q_l, K_l, V_l ──────────── Q_v, K_v, V_v ──────────── Q_a, K_a, V_a
+         │                          │                          │
+         └──────────────────────────┼──────────────────────────┘
+                                    ↓
+                         Joint Flash Attention
+                                    ↓
+                    各自 o_proj → residual → FFN → next layer
+
+推理频率：LLM ~1Hz（任务理解）→ Video ~10Hz（视觉预测）→ Action ~50Hz（实时控制）
+```
+
+**这超越了 COSMOS 3**：COSMOS 3 已经实现了全共享的 LLM + DiT 双模统一，但承受了全共享的四条代价。三 Expert 分离方案在保留双模统一能力的同时，消除了有害干扰、支持频率分离、降低了模态扩展代价。
+
+**也超越了 FastWAM 和 π₀**：FastWAM 有世界模型但缺语义，π₀ 有语义但无世界模型。三 Expert 方案两者兼有。
+
+**核心风险**：三个 Expert 的训练复杂度和资源需求显著提升。一个务实的起点是从 π₀ 出发加 Video Expert（LoRA fine-tune，LLM 主干冻结），或从 FastWAM 出发加 LLM Expert。
+
+---
+
+## 四、实验发现：Attention 路由的耦合属性
 
 ### 3.1 推理弱耦合（已验证）
 
@@ -184,7 +250,7 @@ AR 和 DiT         仅 token 类型区分  2 Expert MoT       2 Expert LLM
 
 ---
 
-## 四、未来架构推测
+## 五、未来架构推测
 
 基于已有证据，Attention 路由路线下的最优架构应具备：
 
@@ -198,7 +264,7 @@ AR 和 DiT         仅 token 类型区分  2 Expert MoT       2 Expert LLM
 
 ---
 
-## 五、研究路线图
+## 六、研究路线图
 
 | 优先级 | 实验 | 验证问题 | 决定什么 |
 |--------|------|---------|---------|
@@ -217,6 +283,6 @@ Phase 3: 架构原型或论文撰写（取决于 P0）
 
 ---
 
-## 六、总结
+## 七、总结
 
 > 机器人世界模型的跨模态交互有两种范式：JEPA 的潜空间对齐，和 WAM/VLA 的 Attention 路由。后者已被四个架构实现——COSMOS 3 和 DreamZero 位于谱的左端（全共享），FastWAM 和 π₀ 位于谱的右端（Expert 分离）。全共享架构存在有害干扰风险（实验 B），Expert 分离架构的训练耦合泛化性待验证（P0）。未来架构的核心问题是：在 Attention 路由的框架下，双模统一（VLM+DiT）能否在 Expert 分离架构中实现？最优的 Expert 分离程度在哪里？这是我们正在回答的问题。
