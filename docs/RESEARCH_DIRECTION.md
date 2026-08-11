@@ -209,15 +209,77 @@ Layer i:
                          Joint Flash Attention
                                     ↓
                     各自 o_proj → residual → FFN → next layer
-
-推理频率：LLM ~1Hz（任务理解）→ Video ~10Hz（视觉预测）→ Action ~50Hz（实时控制）
 ```
 
-**这超越了 COSMOS 3**：COSMOS 3 已经实现了全共享的 LLM + DiT 双模统一，但承受了全共享的四条代价。三 Expert 分离方案在保留双模统一能力的同时，消除了有害干扰、支持频率分离、降低了模态扩展代价。
+### 3.5 优势一：多频率分离执行
 
-**也超越了 FastWAM 和 π₀**：FastWAM 有世界模型但缺语义，π₀ 有语义但无世界模型。三 Expert 方案两者兼有。
+三 Expert 的推理弱耦合（四个架构已验证）直接支持按各自需求独立执行：
 
-**核心风险**：三个 Expert 的训练复杂度和资源需求显著提升。一个务实的起点是从 π₀ 出发加 Video Expert（LoRA fine-tune，LLM 主干冻结），或从 FastWAM 出发加 LLM Expert。
+```
+语义层（LLM Expert, AR/causal）：    ★               ★               ★
+  "任务是什么？如何完成？"              ↑ ~1 Hz（任务切换时重新推理）
+  K_l/V_l 缓存，有效期内不变            │
+                                       │
+视觉层（Video Expert, DiT/diff）：    ★─★─★─★─★─★─★─★─★─★─★─★
+  "动作执行后画面会变成什么样？"         ↑ ~10 Hz（N 个 action chunk 更新一次）
+  K_v/V_v 缓存，视频上下文变化时刷新     │
+                                       │
+动作层（Action Expert, DiT/diff）：   ★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+  "具体关节位置是什么？"                ↑ ~50 Hz（每步仅 forward Action Expert）
+  读 (K_l, V_l) + (K_v, V_v)，O(1)
+```
+
+每步 Action 执行只需要 Action Expert 的 forward + O(1) 读取 LLM/Video K/V 缓存。LLM 和 Video Expert 的 FFN 不需要每次重新计算。这直接解决了全共享架构的"性能受限"挑战。
+
+### 3.6 优势二：完整的功能覆盖
+
+三 Expert 方案继承 COSMOS 3 的全部模式，且每种模式都可以更高效地执行：
+
+| COSMOS 3 模式 | 三 Expert 方案 | 改进 |
+|---|---|---|
+| **Policy**（首帧+指令→video+action） | LLM 理解指令 + Video/Action 联合去噪 | Expert 分离，无有害干扰 |
+| **Forward Dynamics**（首帧+action→video） | Action Expert + Video Expert 联合去噪 | Video 独立生成，不受 Action 噪声干扰 |
+| **Inverse Dynamics**（video→action） | Video Expert 编码 + Action Expert 去噪 | 两者的 noise schedule 独立 |
+| **Reasoner**（text+image→text） | LLM Expert 独立推理 | 不需要 Generator 参与 |
+
+COSMOS 3 能做的，三 Expert 方案都能做——而且每个模式只用到需要的 Expert，不受无关模态的噪声干扰。
+
+### 3.7 优势三：RL 闭环——在想象中学习
+
+这是三 Expert 方案最独特的价值。三个 Expert 各自扮演 Dreamer V3 框架中的角色：
+
+```
+Dreamer V3 组件          三 Expert 对应
+
+World Model        →    Video Expert（forward dynamics: frame_t + action_t → frame_{t+1}）
+Actor / Policy     →    Action Expert（给定 context + noise → action_chunk）
+Critic / Reward    →    LLM Expert（观看生成的视频 → "任务完成了吗？" → reward）
+```
+
+闭环流程：
+
+```
+1. LLM: "wipe the countertop, starting from top-left" → 任务分解 → K_l 缓存（1次）
+2. Action: N 条不同噪声种子的去噪轨迹 → N 组 (action_chunk, video_pred)（每步仅 Action Expert）
+3. Video: autoregressive rollout → frame_{t+H}（Video Expert 充当世界模型）
+4. LLM 裁判: 观看 rollout 视频 → "Did the robot successfully wipe?" → reward
+5. GRPO: advantage → ∂L/∂Expert_weights → 改善 Action（通过 Joint Attention 梯度传递）
+```
+
+**不需要真机，不需要仿真器，不需要 GT action 标注。** 模型在自身的"想象"中学习。我们已经在 DreamZero 上验证了核心机制——纯视频优化 100 步后 action 改善 43.7%（实验 E）。三 Expert 方案将此机制推广到多步 rollout 和语义级 reward。
+
+### 3.8 对比四种方案
+
+| | COSMOS 3（全共享双模） | FastWAM（DiT 双 Expert） | π₀（LLM 双 Expert） | **三 Expert 分离双模** |
+|---|---|---|---|---|
+| **语义理解** | ✓（Reasoner） | ✗ | ✓（LLM） | ✓（LLM Expert） |
+| **视频生成** | ✓（Generator） | ✓（Video Expert） | ✗ | ✓（Video Expert） |
+| **多频率执行** | ✗（全共享，绑一起） | ✓（video KV cache） | ✓（prefix KV cache） | ✓（三类频率独立） |
+| **有害干扰** | 可能有（全共享） | 预期无（分离） | 预期无（分离） | **预期无（分离）** |
+| **RL 闭环** | 基础设施完备（FD rollout + Reasoner），但无 GRPO | 有 FD rollout，无语义 reward | 无语义 reward 来源 | **完整：FD rollout + Reasoner + GRPO** |
+| **训练耦合** | 有（共享参数） | 未知（P0 待验证） | 未知（P0 待验证） | 未知（P0 待验证） |
+
+**核心风险**：三 Expert 的训练资源需求显著高于双 Expert 方案。务实起点：从 π₀（LLM + Action, 已开源, 有 PyTorch port）出发，加 Video Expert（LoRA fine-tune，冻结 LLM 和 Video 主干）。
 
 ---
 
