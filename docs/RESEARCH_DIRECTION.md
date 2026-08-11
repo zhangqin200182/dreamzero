@@ -447,25 +447,41 @@ Layer i:
 
 每个模式只用到需要的 Expert——无关 Expert 不参与 forward，不引入不必要的噪声干扰。
 
-### 5.3 目标三：证明多频率优势——推理精度不降 + 语义理解加持
+### 5.3 目标三：紧耦合训练 + 弱耦合推理——COSMOS 3 的能力 + FastWAM 的效率
 
-**做什么**：利用弱耦合 + 多频率分离执行，实现推理精度不变、延迟降低、且 LLM 层提供真正的语义理解能力。
+**做什么**：训练时通过共享 Attention 实现 AR LLM → Action 的知识迁移（紧耦合），推理时通过 KV cache 分离实现多频率独立执行（弱耦合）。兼顾 COSMOS 3 的语义理解能力和 FastWAM/π₀ 的推理效率。
 
-**为什么 AR LLM 是多频率的关键收益**：
+**核心洞察（来自 COSMOS 3 的深度分析）**：
 
-多频率不是"跳过 Video/Action 计算"那么简单。LLM 层提供的是**真正的语言理解和任务推理**——这和 T5/CLIP 的文本嵌入有本质区别：
+COSMOS 3 的训练优势来自**共享参数的正迁移**——AR Reasoner 训练中学到的语义理解、物理常识、视觉表征、Action CoT，通过同一套 Q/K/V/FFN 权重直接对 DiT Generator 的 Action 生成产生正向影响。这不是推理时的 cross-attention 文本注入——是训练时共享权重产生的表示迁移：
 
 ```
-T5 编码："wipe the countertop from the stain near the sink"
-  → 一个 5120-dim 的文本向量，编码了"语义相似性"
-  → 无法区分"擦水池边的污渍"和"擦桌上的水"
-
-AR LLM："wipe the countertop from the stain near the sink"
-  → 理解"水池边"的空间位置、"污渍"的视觉特征、"从左到右"的动作规划
-  → 为 Video 和 Action 提供精准的多步任务约束
+AR 训练阶段学到的：                    DiT Action 生成时复用的：
+┌─────────────────────────┐         ┌─────────────────────────┐
+│ "pick up the blue cup"  │         │ Policy 模式:              │
+│   → 蓝色杯子的视觉特征    │─────────→ 处理同一段指令文本          │
+│   → "抓取"的运动语义      │         │ 用的是同一套 W_Q/W_K/W_V   │
+│   → 物体间空间关系        │         │ 生成动作序列                │
+│   → 物理合理性            │         │ [gripper_open,             │
+│   → 时序因果关系          │         │  move_to(x,y,z),           │
+│                         │         │  gripper_close]            │
+└─────────────────────────┘         └─────────────────────────┘
 ```
 
-这种语义泛化能力在未见过的任务指令上尤为关键——T5/CLIP 只能处理训练数据中见过的表述，AR LLM 可以推理新的表述。
+但 COSMOS 3 为此付出了**全共享架构的代价**——推理时 AR 和 DiT 无法分离，性能受限。
+
+**我们的方案**：用 Expert 分离的共享 Attention 替代全共享参数，获得同样的训练迁移效果（紧耦合训练发生在 Joint Attention 的 Q·K^T 中），同时保留推理分离能力（弱耦合推理通过 KV cache 实现）。
+
+| | COSMOS 3 | 三 Expert |
+|---|---|---|
+| **训练知识迁移** | ✓（共享 Q/K/V/FFN 参数） | ✓（共享 Attention 的 Q·K^T，40 层分布式） |
+| **推理分离** | ✗（全共享，绑一起） | ✓（弱耦合，各 Expert 独立 KV cache） |
+| **推理性能** | 受限于全共享 | 多频率，3-4× 加速 |
+| **有害干扰** | 有（全共享，实验 B） | 预期无（Expert 分离） |
+
+**为什么 AR LLM 必须和 Video/Action 在共享 Attention 中训练**：
+
+如果 LLM 单独训练（或冻结），仅在推理时通过 cross-attention 注入文本——这就是 T5/CLIP 的升级版（更强的文本编码器）。可以提升文本理解质量，但**无法获得训练时的语义迁移效果**——AR 阶段学到的物理常识、运动语义、Action CoT 不会通过共享 Attention 的梯度传递到 Action。COSMOS 3 的 AR→Action 知识迁移正是靠共享权重实现的，我们的方案用共享 Attention 实现同样的机制。
 
 **如何实现——Block-Causal Mask 避免 AR vs DiT 冲突**：
 
@@ -620,9 +636,8 @@ prefill_video_cache:           forward_action_with_video_cache:
 | **F5 ★★★** | **梯度传播** | 仅 backward video loss，测 Action 变化（平行 DreamZero 实验 D） | **DiT-DiT Expert 分离中强耦合是否成立？** ← 这是真正的 P0 | **决定目标 4（RL 闭环）的可行性** |
 | **F6 ★★** | Random 替换 | 替换 video latent → 测 Action 变化（平行 DreamZero 实验 B） | DiT-DiT Expert 分离中有害干扰？ | 目标 1 |
 | **F7 ★★★** | **三层多频率精度** | FastWAM + 轻量 AR LLM（冻结 Gemma 2B），block-causal：LLM 1 次 → Video 1 次 → Action 30 步 | 三 Expert 分离推理 vs Full joint 的精度对比？ | 目标 3 |
-| **F8 ★★** | **语义 vs 文本消融** | 相同任务，AR LLM 语义条件 vs T5 文本编码条件 → Action 精度差 | AR LLM 语义理解相比 T5 的增量收益？ | 目标 3 |
-| **F9 ★★★** | **LLM K/V vs T5 向量消融** | 对比"AR LLM 完整 18 层 K/V 注入"vs"仅 LLM 最后一层 CLS token"vs"T5 文本向量"→ Action 精度 | 共享 Attention 带来的 rich K/V 是否优于单一文本向量？ | **决定 AR LLM 是否需要共享 Attention** |
-| **F10 ★★** | **共享 Attention vs 外部 VLM reward** | 对比"LLM 通过 Joint Attention 看 video latent"vs"外部 VLM 看渲染视频"→ reward 打分准确率 | LLM 直接访问 Video Expert latent 是否比看渲染视频更准？ | **决定 AR LLM 是否需要内置（vs 外部 API）** |
+| **F8 ★★★** | **共享 Attention 训练 vs 独立训练消融** | 三 Expert 联合训练（LLM 在共享 Attention 中训练）vs LLM 冻结仅推理注入 vs T5 基线 → Action 精度 | 共享 Attention 中的语义迁移是否优于独立训练的文本注入？ | **决定 AR LLM 是否需要参与训练（vs 仅推理注入）** |
+| **F9 ★★** | **共享 Attention vs 外部 VLM reward** | 对比"LLM 通过 Joint Attention 看 video latent"vs"外部 VLM 看渲染视频"→ reward 打分准确率 | LLM 直接访问 Video Expert latent 是否比看渲染视频更准？ | **决定 AR LLM 是否需要内置（vs 外部 API）** |
 
 **F1-F4 是多频率计算层面的核心验证，F7-F8（新增）是多频率语义层面的验证，F5 是 P0，F6 验证有害干扰假说。**
 
@@ -644,9 +659,15 @@ prefill_video_cache:           forward_action_with_video_cache:
 | Block-causal 可行性 | ✗ | ✓（18 层已验证） | ✓（30 层，同机制） | ✗ |
 | 多频率完整验证 | ✗ | 部分（无 Video 层） | **完整（可测三层语义→视觉→动作）** | ✗ |
 
-**F9/F10 是三 Expert 架构的"存在性论证"**：
+**F8/F9 验证的是"共享 Attention 训练"的必要性，而非"LLM K/V vs T5 向量"的推理差异**：
 
-三 Expert 架构有两个核心主张：(1) AR LLM 通过共享 Attention 提供比 T5 向量更丰富的语义条件（F9），(2) LLM 共享 Attention 比外部 VLM 更适合做视频 reward 判断（F10）。如果两个都不成立——T5 足够，外部 VLM 也足够——那三 Expert 架构中内置 AR LLM 的理由不存在。两 Expert（FastWAM 现有架构）+ 外部 LLM API 就够了。
+三 Expert 的核心主张不是"推理时 K/V 比文本向量丰富"（弱耦合告诉我们 Video token 的值都不重要，LLM K/V 的值同理），而是**训练时 LLM 必须在共享 Attention 中与 Video/Action 联合训练，才能获得 COSMOS 3 级别的语义迁移效果**。如果 LLM 单独训练（或冻结），仅推理时注入 cross-attention，无法复现 COSMOS 3 的 AR→Action 知识迁移。
+
+| 对照组 | 训练方式 | 预期效果 |
+|--------|---------|---------|
+| 三 Expert 联合训练 | LLM + Video + Action 在共享 Attention 中训练 | COSMOS 3 级别的语义迁移 |
+| LLM 冻结 + 仅推理注入 | LLM 冻结，仅 cross-attention 注入文本 | 升级版 T5，无训练迁移 |
+| T5 文本编码（基线） | FastWAM 当前方案 | 基线 |
 
 **FastWAM 加 AR LLM 是验证目标 3（多层多频率语义理解）的最短路径——不需要等新架构搭建。** AR LLM 只需要一个冻结的 Gemma 2B + block-causal mask（从 π₀ 参考）。这不是生产级的语义层，但足够验证"多层多频率 + 语义理解"的核心主张。
 
